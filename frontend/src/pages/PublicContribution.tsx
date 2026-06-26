@@ -110,10 +110,10 @@ function normalizedStatus(status?: string | null): string {
 
 function statusClass(status: string): string {
   const normalized = normalizedStatus(status)
-  if (normalized === 'active' || normalized === 'ready') return 'border-emerald-400/25 bg-emerald-500/15 text-emerald-200'
-  if (normalized.includes('rate') || normalized.includes('cooldown') || normalized.includes('quota')) return 'border-amber-400/25 bg-amber-500/15 text-amber-200'
-  if (normalized.includes('error') || normalized.includes('unauthorized') || normalized.includes('deleted')) return 'border-red-400/25 bg-red-500/15 text-red-200'
-  return 'border-sky-400/25 bg-sky-500/15 text-sky-200'
+  if (normalized === 'active' || normalized === 'ready') return 'border-emerald-500/20 bg-emerald-500/12 text-emerald-700 dark:text-emerald-300'
+  if (normalized.includes('rate') || normalized.includes('cooldown') || normalized.includes('quota')) return 'border-amber-500/20 bg-amber-500/12 text-amber-700 dark:text-amber-300'
+  if (normalized.includes('error') || normalized.includes('unauthorized') || normalized.includes('deleted')) return 'border-red-500/20 bg-red-500/12 text-red-700 dark:text-red-300'
+  return 'border-sky-500/20 bg-sky-500/12 text-sky-700 dark:text-sky-300'
 }
 
 function accountAvailability(status: string): string {
@@ -141,14 +141,14 @@ function testStatusLabel(account: ContributionLookupAccount): string {
 function UsageBar({ label, value }: { label: string; value?: number | null }) {
   const hasValue = typeof value === 'number' && Number.isFinite(value)
   const width = hasValue ? clampPercent(value) : 0
-  const barClass = width >= 90 ? 'bg-red-400' : width >= 70 ? 'bg-amber-400' : 'bg-emerald-400'
+  const barClass = width >= 90 ? 'bg-red-500' : width >= 70 ? 'bg-amber-500' : 'bg-emerald-500'
   return (
     <div className="space-y-1.5">
-      <div className="flex items-center justify-between text-xs text-slate-400">
+      <div className="flex items-center justify-between text-xs text-muted-foreground">
         <span>{label}</span>
-        <span className="font-semibold text-slate-200">{formatPercent(value)}</span>
+        <span className="font-semibold text-foreground">{formatPercent(value)}</span>
       </div>
-      <div className="h-1.5 overflow-hidden rounded-full bg-white/10">
+      <div className="h-1.5 overflow-hidden rounded-full bg-muted">
         <div className={'h-full rounded-full ' + barClass} style={{ width: hasValue ? width + '%' : '0%' }} />
       </div>
     </div>
@@ -159,45 +159,45 @@ function AccountCard({ account, deleting, onDelete }: { account: ContributionLoo
   const displayName = account.name || account.email || 'ID ' + account.id
   const updatedAt = account.codex_usage_updated_at || account.codex_5h_usage_updated_at || account.updated_at
   return (
-    <article className="grid min-w-0 gap-4 rounded-lg border border-white/10 bg-[#151d2b] p-4 shadow-sm shadow-black/10 xl:grid-cols-[minmax(180px,1fr)_minmax(180px,.95fr)_minmax(132px,.6fr)_88px] xl:items-center">
+    <article className="grid min-w-0 gap-4 rounded-lg border border-border bg-background/60 p-4 shadow-sm xl:grid-cols-[minmax(180px,1fr)_minmax(180px,.95fr)_minmax(132px,.6fr)_88px] xl:items-center">
       <div className="min-w-0">
         <div className="flex flex-wrap items-center gap-2">
-          <span className="rounded-md bg-sky-500/15 px-2 py-1 text-xs font-bold text-sky-200 ring-1 ring-sky-400/20">#{account.id}</span>
-          <span className="rounded-md bg-white/8 px-2 py-1 text-xs font-semibold text-slate-300 ring-1 ring-white/10">{account.plan_type || TEXT.unknown}</span>
+          <span className="rounded-md bg-sky-500/12 px-2 py-1 text-xs font-bold text-sky-700 ring-1 ring-sky-500/20 dark:text-sky-300">#{account.id}</span>
+          <span className="rounded-md bg-muted px-2 py-1 text-xs font-semibold text-muted-foreground ring-1 ring-border">{account.plan_type || TEXT.unknown}</span>
         </div>
-        <h3 className="mt-3 break-all text-base font-bold text-slate-100 xl:mt-2">{displayName}</h3>
-        <p className="mt-1 break-all text-xs font-mono text-slate-500">{account.email || TEXT.unknown}</p>
+        <h3 className="mt-3 break-all text-base font-bold text-foreground xl:mt-2">{displayName}</h3>
+        <p className="mt-1 break-all text-xs font-mono text-muted-foreground">{account.email || TEXT.unknown}</p>
       </div>
 
-      <div className="space-y-3 border-t border-white/10 pt-4 xl:border-t-0 xl:pt-0">
-        <div className="flex items-center gap-2 text-xs font-semibold text-slate-300">
-          <Clock3 className="size-3.5 text-sky-300" />
+      <div className="space-y-3 border-t border-border pt-4 xl:border-t-0 xl:pt-0">
+        <div className="flex items-center gap-2 text-xs font-semibold text-foreground">
+          <Clock3 className="size-3.5 text-sky-600 dark:text-sky-300" />
           {TEXT.usage}
         </div>
         <UsageBar label="7d" value={account.usage_percent_7d} />
         <UsageBar label="5h" value={account.usage_percent_5h} />
       </div>
 
-      <div className="grid grid-cols-2 gap-3 text-sm text-slate-300 xl:grid-cols-1 xl:gap-2">
+      <div className="grid grid-cols-2 gap-3 text-sm text-foreground xl:grid-cols-1 xl:gap-2">
         <div>
-          <div className="text-xs text-slate-500">{TEXT.accountStatus}</div>
+          <div className="text-xs text-muted-foreground">{TEXT.accountStatus}</div>
           <div className={'mt-1 inline-flex rounded-full border px-2 py-0.5 text-xs font-semibold ' + statusClass(account.status)}>{accountAvailability(account.status)}</div>
         </div>
         <div>
-          <div className="text-xs text-slate-500">{TEXT.testStatus}</div>
+          <div className="text-xs text-muted-foreground">{TEXT.testStatus}</div>
           <div className={'mt-1 inline-flex rounded-full border px-2 py-0.5 text-xs font-semibold ' + statusClass(account.last_test_status || account.status)}>{testStatusLabel(account)}</div>
         </div>
         <div>
-          <div className="text-xs text-slate-500">{TEXT.credits}</div>
-          <div className="mt-1 font-semibold text-slate-100">{account.rate_limit_reset_credits ?? 0}</div>
+          <div className="text-xs text-muted-foreground">{TEXT.credits}</div>
+          <div className="mt-1 font-semibold text-foreground">{account.rate_limit_reset_credits ?? 0}</div>
         </div>
         <div>
-          <div className="text-xs text-slate-500">{TEXT.updatedAt}</div>
-          <div className="mt-1 font-semibold text-slate-100">{formatDateTime(updatedAt)}</div>
+          <div className="text-xs text-muted-foreground">{TEXT.updatedAt}</div>
+          <div className="mt-1 font-semibold text-foreground">{formatDateTime(updatedAt)}</div>
         </div>
       </div>
 
-      <button type="button" onClick={() => onDelete(account)} disabled={deleting} className="inline-flex h-9 w-full min-w-0 cursor-pointer items-center justify-center gap-1.5 rounded-md border border-red-400/30 bg-red-500/10 px-2 text-sm font-semibold text-red-200 transition-colors hover:bg-red-500/15 disabled:cursor-not-allowed disabled:opacity-50">
+      <button type="button" onClick={() => onDelete(account)} disabled={deleting} className="inline-flex h-9 w-full min-w-0 cursor-pointer items-center justify-center gap-1.5 rounded-md border border-red-500/25 bg-red-500/10 px-2 text-sm font-semibold text-red-700 transition-colors hover:bg-red-500/15 disabled:cursor-not-allowed disabled:opacity-50 dark:text-red-300">
         {deleting ? <Loader2 className="size-4 shrink-0 animate-spin" /> : <Trash2 className="size-4 shrink-0" />}
         <span className="truncate">{deleting ? TEXT.deleting : TEXT.delete}</span>
       </button>
@@ -359,20 +359,20 @@ export default function PublicContribution() {
   }
 
   return (
-    <div className="min-h-dvh bg-[#0b1020] px-4 py-8 text-slate-100">
+    <div className="min-h-dvh bg-background px-4 py-8 text-foreground">
       <div className={('mx-auto flex w-full flex-col gap-5 ' + (status ? 'max-w-6xl' : 'max-w-2xl'))}>
         <header className="text-center">
           <img src={logoSrc} alt={siteName} className="mx-auto mb-4 size-14 rounded-lg object-cover shadow-sm" />
           <h1 className="text-[26px] font-bold">{TEXT.title}</h1>
-          <p className="mt-2 text-sm text-slate-400">{TEXT.subtitle}</p>
+          <p className="mt-2 text-sm text-muted-foreground">{TEXT.subtitle}</p>
         </header>
 
-        <section className="rounded-lg border border-white/10 bg-[#111827] p-5 shadow-xl shadow-black/20">
+        <section className="rounded-lg border border-border bg-card p-5 text-card-foreground shadow-sm">
           <form className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_160px] lg:items-end" onSubmit={handleSubmit}>
             <div>
-              <label className="mb-2 block text-sm font-semibold text-slate-300" htmlFor="contribution-email">{TEXT.email}</label>
+              <label className="mb-2 block text-sm font-semibold text-foreground" htmlFor="contribution-email">{TEXT.email}</label>
               <div className="relative">
-                <Mail className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-slate-500" />
+                <Mail className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
                 <input
                   id="contribution-email"
                   type="email"
@@ -386,41 +386,41 @@ export default function PublicContribution() {
                   }}
                   placeholder="name@example.com"
                   autoComplete="email"
-                  className="h-11 w-full rounded-md border border-white/10 bg-[#0b1220] pl-9 pr-3.5 text-[15px] text-slate-100 outline-none transition-all placeholder:text-slate-600 focus:border-indigo-400/70 focus:ring-2 focus:ring-indigo-400/15 disabled:cursor-not-allowed disabled:opacity-70"
+                  className="h-11 w-full rounded-md border border-input bg-background pl-9 pr-3.5 text-[15px] text-foreground outline-none transition-all placeholder:text-muted-foreground focus:border-ring focus:ring-2 focus:ring-ring/20 disabled:cursor-not-allowed disabled:opacity-70"
                 />
               </div>
             </div>
-            <button type="submit" disabled={submitting || !trimmedEmail} className="flex h-11 w-full cursor-pointer items-center justify-center gap-2 rounded-md bg-indigo-500 text-[15px] font-semibold text-white shadow-sm transition-colors hover:bg-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-300/30 disabled:cursor-not-allowed disabled:opacity-50">
+            <button type="submit" disabled={submitting || !trimmedEmail} className="flex h-11 w-full cursor-pointer items-center justify-center gap-2 rounded-md bg-primary text-[15px] font-semibold text-primary-foreground shadow-sm transition-colors hover:bg-primary/90 focus:outline-none focus:ring-2 focus:ring-ring/40 disabled:cursor-not-allowed disabled:opacity-50">
               {submitting ? <Loader2 className="size-4 animate-spin" /> : <Send className="size-4" />}
               {submitting ? TEXT.querying : TEXT.query}
             </button>
           </form>
-          {error ? <div className="mt-4 rounded-md border border-red-400/20 bg-red-500/10 px-3 py-2 text-sm font-medium text-red-200">{error}</div> : null}
+          {error ? <div className="mt-4 rounded-md border border-red-400/20 bg-red-500/10 px-3 py-2 text-sm font-medium text-red-700 dark:text-red-200">{error}</div> : null}
         </section>
 
         {status ? (
           <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_360px] xl:items-start">
-            <section className="rounded-lg border border-white/10 bg-[#111827] p-5 shadow-xl shadow-black/20">
+            <section className="rounded-lg border border-border bg-card p-5 text-card-foreground shadow-sm">
               <div className="flex items-start gap-3">
-                <div className={status.contributed ? 'flex size-10 items-center justify-center rounded-full bg-emerald-500/15 text-emerald-300' : 'flex size-10 items-center justify-center rounded-full bg-amber-500/15 text-amber-300'}>
+                <div className={status.contributed ? 'flex size-10 items-center justify-center rounded-full bg-emerald-500/15 text-emerald-700 dark:text-emerald-300' : 'flex size-10 items-center justify-center rounded-full bg-amber-500/15 text-amber-700 dark:text-amber-300'}>
                   {status.contributed ? <CheckCircle2 className="size-5" /> : <KeyRound className="size-5" />}
                 </div>
                 <div className="min-w-0 flex-1">
                   <div className="flex flex-wrap items-center gap-2">
                     <h2 className="text-base font-semibold">{status.contributed ? TEXT.contributed : TEXT.notContributed}</h2>
-                    <span className="rounded-full bg-white/8 px-2 py-0.5 text-xs font-semibold text-slate-300 ring-1 ring-white/10">{status.count} {TEXT.accountCount}</span>
+                    <span className="rounded-full bg-muted px-2 py-0.5 text-xs font-semibold text-foreground ring-1 ring-border">{status.count} {TEXT.accountCount}</span>
                   </div>
-                  <p className="mt-1 break-all text-sm leading-relaxed text-slate-400">
+                  <p className="mt-1 break-all text-sm leading-relaxed text-muted-foreground">
                     {status.contributed ? TEXT.matchedPrefix + status.count + TEXT.matchedSuffix : TEXT.notMatchedDesc}
                   </p>
                 </div>
               </div>
 
               {accounts.length > 0 ? (
-                <div className="mt-5 space-y-3 border-t border-white/10 pt-5">
+                <div className="mt-5 space-y-3 border-t border-border pt-5">
                   <div className="flex items-center justify-between gap-3">
-                    <h3 className="text-sm font-bold text-slate-200">{TEXT.accountList}</h3>
-                    <span className="text-xs text-slate-500">{accounts.length} {TEXT.accountCount}</span>
+                    <h3 className="text-sm font-bold text-foreground">{TEXT.accountList}</h3>
+                    <span className="text-xs text-muted-foreground">{accounts.length} {TEXT.accountCount}</span>
                   </div>
                   <div className="space-y-2">
                     {accounts.map((account) => (
@@ -431,70 +431,70 @@ export default function PublicContribution() {
               ) : null}
             </section>
 
-            <section className="rounded-lg border border-white/10 bg-[#111827] p-5 shadow-xl shadow-black/20">
+            <section className="rounded-lg border border-border bg-card p-5 text-card-foreground shadow-sm">
               <div className="flex items-start gap-3">
-                <div className="flex size-10 items-center justify-center rounded-full bg-indigo-500/15 text-indigo-200">
+                <div className="flex size-10 items-center justify-center rounded-full bg-primary/10 text-primary">
                   <PlusCircle className="size-5" />
                 </div>
                 <div className="min-w-0 flex-1">
                   <h2 className="text-base font-semibold">{TEXT.addTitle}</h2>
-                  <p className="mt-1 text-sm text-slate-400">{TEXT.addDesc}</p>
+                  <p className="mt-1 text-sm text-muted-foreground">{TEXT.addDesc}</p>
                 </div>
               </div>
 
-              <div className="mt-5 space-y-4 border-t border-white/10 pt-5">
+              <div className="mt-5 space-y-4 border-t border-border pt-5">
                 <div>
-                  <label className="mb-2 block text-sm font-semibold text-slate-300" htmlFor="oauth-name">{TEXT.nameLabel}</label>
-                  <input id="oauth-name" value={oauthName} onChange={(event) => setOauthName(event.target.value)} placeholder={TEXT.namePlaceholder} className="h-10 w-full rounded-md border border-white/10 bg-[#0b1220] px-3.5 text-[15px] text-slate-100 outline-none transition-all placeholder:text-slate-600 focus:border-indigo-400/70 focus:ring-2 focus:ring-indigo-400/15 disabled:cursor-not-allowed disabled:opacity-70" />
+                  <label className="mb-2 block text-sm font-semibold text-foreground" htmlFor="oauth-name">{TEXT.nameLabel}</label>
+                  <input id="oauth-name" value={oauthName} onChange={(event) => setOauthName(event.target.value)} placeholder={TEXT.namePlaceholder} className="h-10 w-full rounded-md border border-input bg-background px-3.5 text-[15px] text-foreground outline-none transition-all placeholder:text-muted-foreground focus:border-ring focus:ring-2 focus:ring-ring/20 disabled:cursor-not-allowed disabled:opacity-70" />
                 </div>
 
                 {oauthSession ? (
                   <div className="space-y-4">
                     <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-1 2xl:grid-cols-2">
-                      <a href={oauthSession.auth_url} target="_blank" rel="noreferrer" className="flex h-10 w-full cursor-pointer items-center justify-center gap-2 rounded-md border border-emerald-400/30 bg-emerald-500/10 px-3 text-sm font-semibold text-emerald-200 transition-colors hover:bg-emerald-500/15">
+                      <a href={oauthSession.auth_url} target="_blank" rel="noreferrer" className="flex h-10 w-full cursor-pointer items-center justify-center gap-2 rounded-md border border-emerald-500/25 bg-emerald-500/10 px-3 text-sm font-semibold text-emerald-700 dark:text-emerald-300 transition-colors hover:bg-emerald-500/15">
                         <ExternalLink className="size-4 shrink-0" />
                         <span className="truncate">{TEXT.openAuth}</span>
                       </a>
-                      <button type="button" onClick={() => void copyAuthUrl()} className="flex h-10 w-full cursor-pointer items-center justify-center gap-2 rounded-md border border-white/10 bg-white/5 px-3 text-sm font-semibold text-slate-200 transition-colors hover:bg-white/10">
+                      <button type="button" onClick={() => void copyAuthUrl()} className="flex h-10 w-full cursor-pointer items-center justify-center gap-2 rounded-md border border-border bg-background px-3 text-sm font-semibold text-foreground transition-colors hover:bg-muted">
                         <Copy className="size-4 shrink-0" />
                         <span className="truncate">{TEXT.copyAuth}</span>
                       </button>
                     </div>
                     <div>
-                      <label className="mb-2 block text-sm font-semibold text-slate-300" htmlFor="callback-url">{TEXT.callbackUrl}</label>
-                      <textarea id="callback-url" rows={4} value={callbackUrl} onChange={(event) => setCallbackUrl(event.target.value)} placeholder="http://localhost:1455/auth/callback?code=...&state=..." className="w-full resize-none rounded-md border border-white/10 bg-[#0b1220] px-3.5 py-2.5 text-sm text-slate-100 outline-none transition-all placeholder:text-slate-600 focus:border-indigo-400/70 focus:ring-2 focus:ring-indigo-400/15 disabled:cursor-not-allowed disabled:opacity-70" />
+                      <label className="mb-2 block text-sm font-semibold text-foreground" htmlFor="callback-url">{TEXT.callbackUrl}</label>
+                      <textarea id="callback-url" rows={4} value={callbackUrl} onChange={(event) => setCallbackUrl(event.target.value)} placeholder="http://localhost:1455/auth/callback?code=...&state=..." className="w-full resize-none rounded-md border border-input bg-background px-3.5 py-2.5 text-sm text-foreground outline-none transition-all placeholder:text-muted-foreground focus:border-ring focus:ring-2 focus:ring-ring/20 disabled:cursor-not-allowed disabled:opacity-70" />
                     </div>
                     <div className="grid grid-cols-2 gap-3">
-                      <button type="button" onClick={handleGenerateOAuth} disabled={oauthLoading} className="flex h-10 cursor-pointer items-center justify-center gap-2 rounded-md border border-white/10 text-sm font-semibold text-slate-200 transition-colors hover:bg-white/5 disabled:opacity-50">
+                      <button type="button" onClick={handleGenerateOAuth} disabled={oauthLoading} className="flex h-10 cursor-pointer items-center justify-center gap-2 rounded-md border border-border text-sm font-semibold text-foreground transition-colors hover:bg-muted disabled:opacity-50">
                         <RotateCcw className="size-4" />
                         {TEXT.updateLink}
                       </button>
-                      <button type="button" onClick={handleCompleteOAuth} disabled={oauthLoading || !callbackUrl.trim()} className="flex h-10 cursor-pointer items-center justify-center gap-2 rounded-md bg-indigo-500 text-sm font-semibold text-white transition-colors hover:bg-indigo-400 disabled:opacity-50">
+                      <button type="button" onClick={handleCompleteOAuth} disabled={oauthLoading || !callbackUrl.trim()} className="flex h-10 cursor-pointer items-center justify-center gap-2 rounded-md bg-primary text-sm font-semibold text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-50">
                         {oauthLoading ? <Loader2 className="size-4 animate-spin" /> : <CheckCircle2 className="size-4" />}
                         {TEXT.completeAdd}
                       </button>
                     </div>
                   </div>
                 ) : (
-                  <button type="button" onClick={handleGenerateOAuth} disabled={oauthLoading} className="flex h-10 w-full cursor-pointer items-center justify-center gap-2 rounded-md bg-indigo-500 text-sm font-semibold text-white transition-colors hover:bg-indigo-400 disabled:opacity-50">
+                  <button type="button" onClick={handleGenerateOAuth} disabled={oauthLoading} className="flex h-10 w-full cursor-pointer items-center justify-center gap-2 rounded-md bg-primary text-sm font-semibold text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-50">
                     {oauthLoading ? <Loader2 className="size-4 animate-spin" /> : <KeyRound className="size-4" />}
                     {TEXT.generate}
                   </button>
                 )}
               </div>
-              {oauthDone ? <div className="mt-4 rounded-md border border-emerald-400/20 bg-emerald-500/10 px-3 py-2 text-sm font-medium text-emerald-200">{TEXT.addSuccess}</div> : null}
+              {oauthDone ? <div className="mt-4 rounded-md border border-emerald-500/20 bg-emerald-500/10 px-3 py-2 text-sm font-medium text-emerald-700 dark:text-emerald-300">{TEXT.addSuccess}</div> : null}
 
               {status.contributed ? (
-                <div className="mt-5 border-t border-white/10 pt-5">
+                <div className="mt-5 border-t border-border pt-5">
                   <div className="flex items-start gap-3">
-                    <div className="flex size-9 items-center justify-center rounded-full bg-sky-500/15 text-sky-200">
+                    <div className="flex size-9 items-center justify-center rounded-full bg-sky-500/15 text-sky-700 dark:text-sky-300">
                       <KeyRound className="size-[18px]" />
                     </div>
                     <div className="min-w-0 flex-1">
                       <h2 className="text-base font-semibold">{TEXT.apiKeyTitle}</h2>
-                      <p className="mt-1 text-sm text-slate-400">{TEXT.apiKeyDesc}</p>
+                      <p className="mt-1 text-sm text-muted-foreground">{TEXT.apiKeyDesc}</p>
                       {!apiKeyEligible ? (
-                        <p className="mt-2 rounded-md border border-amber-400/20 bg-amber-500/10 px-2.5 py-2 text-xs font-medium text-amber-100">
+                        <p className="mt-2 rounded-md border border-amber-500/20 bg-amber-500/10 px-2.5 py-2 text-xs font-medium text-amber-700 dark:text-amber-200">
                           {apiKeyBlockedMessage}
                         </p>
                       ) : null}
@@ -503,7 +503,7 @@ export default function PublicContribution() {
 
                   <div className="mt-4 space-y-3">
                     <div>
-                      <label className="mb-2 block text-sm font-semibold text-slate-300" htmlFor="api-key-name">{TEXT.apiKeyName}</label>
+                      <label className="mb-2 block text-sm font-semibold text-foreground" htmlFor="api-key-name">{TEXT.apiKeyName}</label>
                       <input
                         id="api-key-name"
                         value={apiKeyName}
@@ -514,7 +514,7 @@ export default function PublicContribution() {
                         }}
                         disabled={hasSavedApiKey || apiKeyLoading || !apiKeyEligible}
                         placeholder={TEXT.apiKeyNamePlaceholder}
-                        className="h-10 w-full rounded-md border border-white/10 bg-[#0b1220] px-3.5 text-[15px] text-slate-100 outline-none transition-all placeholder:text-slate-600 focus:border-indigo-400/70 focus:ring-2 focus:ring-indigo-400/15 disabled:cursor-not-allowed disabled:opacity-70"
+                        className="h-10 w-full rounded-md border border-input bg-background px-3.5 text-[15px] text-foreground outline-none transition-all placeholder:text-muted-foreground focus:border-ring focus:ring-2 focus:ring-ring/20 disabled:cursor-not-allowed disabled:opacity-70"
                       />
                     </div>
                     <button type="button" onClick={handleGenerateApiKey} disabled={apiKeyLoading || !canGenerateApiKey} className="flex h-10 w-full cursor-pointer items-center justify-center gap-2 rounded-md bg-sky-500 text-sm font-semibold text-white transition-colors hover:bg-sky-400 disabled:cursor-not-allowed disabled:opacity-50">
@@ -524,26 +524,26 @@ export default function PublicContribution() {
                   </div>
 
                   {apiKeyResult ? (
-                    <div className="mt-4 space-y-3 rounded-md border border-sky-400/20 bg-sky-500/10 p-3">
-                      <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-sky-100">
+                    <div className="mt-4 space-y-3 rounded-md border border-sky-500/20 bg-sky-500/10 p-3">
+                      <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-sky-700 dark:text-sky-200">
                         <span>{apiKeyResult.already_created ? TEXT.existingApiKey : TEXT.createdApiKey}</span>
-                        <span className="rounded-full border border-sky-300/25 px-2 py-0.5 font-semibold">{TEXT.providerGroup}: {apiKeyResult.provider_group}</span>
+                        <span className="rounded-full border border-sky-500/25 px-2 py-0.5 font-semibold">{TEXT.providerGroup}: {apiKeyResult.provider_group}</span>
                       </div>
                       <div>
-                        <div className="mb-1.5 text-xs font-semibold text-slate-400">{TEXT.serviceBaseUrl}</div>
+                        <div className="mb-1.5 text-xs font-semibold text-muted-foreground">{TEXT.serviceBaseUrl}</div>
                         <div className="flex min-w-0 items-center gap-2">
-                          <code className="min-w-0 flex-1 truncate rounded-md bg-[#0b1220] px-2.5 py-2 text-xs text-slate-200">{apiKeyResult.base_url}</code>
-                          <button type="button" onClick={() => void copyText(apiKeyResult.base_url)} className="inline-flex h-9 shrink-0 cursor-pointer items-center justify-center gap-1.5 rounded-md border border-white/10 px-2.5 text-xs font-semibold text-slate-200 transition-colors hover:bg-white/5">
+                          <code className="min-w-0 flex-1 truncate rounded-md bg-muted px-2.5 py-2 text-xs text-foreground">{apiKeyResult.base_url}</code>
+                          <button type="button" onClick={() => void copyText(apiKeyResult.base_url)} className="inline-flex h-9 shrink-0 cursor-pointer items-center justify-center gap-1.5 rounded-md border border-border px-2.5 text-xs font-semibold text-foreground transition-colors hover:bg-muted">
                             <Copy className="size-3.5" />
                             {TEXT.copyBaseUrl}
                           </button>
                         </div>
                       </div>
                       <div>
-                        <div className="mb-1.5 text-xs font-semibold text-slate-400">{TEXT.apiKeyValue}</div>
+                        <div className="mb-1.5 text-xs font-semibold text-muted-foreground">{TEXT.apiKeyValue}</div>
                         <div className="flex min-w-0 items-center gap-2">
-                          <code className="min-w-0 flex-1 truncate rounded-md bg-[#0b1220] px-2.5 py-2 text-xs text-slate-200">{apiKeyResult.api_key}</code>
-                          <button type="button" onClick={() => void copyText(apiKeyResult.api_key)} className="inline-flex h-9 shrink-0 cursor-pointer items-center justify-center gap-1.5 rounded-md border border-white/10 px-2.5 text-xs font-semibold text-slate-200 transition-colors hover:bg-white/5">
+                          <code className="min-w-0 flex-1 truncate rounded-md bg-muted px-2.5 py-2 text-xs text-foreground">{apiKeyResult.api_key}</code>
+                          <button type="button" onClick={() => void copyText(apiKeyResult.api_key)} className="inline-flex h-9 shrink-0 cursor-pointer items-center justify-center gap-1.5 rounded-md border border-border px-2.5 text-xs font-semibold text-foreground transition-colors hover:bg-muted">
                             <Copy className="size-3.5" />
                             {TEXT.copyApiKey}
                           </button>
@@ -557,7 +557,7 @@ export default function PublicContribution() {
           </div>
         ) : null}
 
-        <div className="flex items-center justify-center gap-2 text-xs text-slate-500">
+        <div className="flex items-center justify-center gap-2 text-xs text-muted-foreground">
           <ShieldCheck className="size-3.5" />
           <span>{TEXT.privacy}</span>
         </div>

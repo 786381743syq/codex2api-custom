@@ -144,8 +144,8 @@ export default function ContributionLookup() {
   }
 
   const shareUrl = useMemo(() => {
-    if (typeof window === 'undefined') return '/admin/contribute'
-    return `${window.location.origin}/admin/contribute`
+    if (typeof window === 'undefined') return '/contribute'
+    return `${window.location.origin}/contribute`
   }, [])
 
   const shareCopy = {

@@ -59,10 +59,12 @@ type cchKeyResponse struct {
 }
 
 type cchCreateUserResponse struct {
+	ID   any `json:"id"`
 	User struct {
 		ID any `json:"id"`
 	} `json:"user"`
-	DefaultKey *cchKeyResponse `json:"defaultKey"`
+	DefaultKey *cchKeyResponse  `json:"defaultKey"`
+	Keys       []cchKeyResponse `json:"keys"`
 }
 
 type cchHTTPError struct {
@@ -223,22 +225,30 @@ func (cfg cchClientConfig) revealKey(ctx context.Context, keyID string) (string,
 
 func (cfg cchClientConfig) createContributorKey(ctx context.Context, keyName string, email string) (userID string, keyID string, apiKey string, err error) {
 	createBody := map[string]any{
-		"name":      keyName,
-		"note":      contributionCCHNote(cfg.note, email),
-		"tags":      []string{"contributor"},
-		"isEnabled": true,
+		"name":          keyName,
+		"note":          contributionCCHNote(cfg.note, email),
+		"providerGroup": cfg.providerGroup,
+		"tags":          []string{"contributor"},
+		"isEnabled":     true,
 	}
 	var created cchCreateUserResponse
 	if err := cfg.doJSON(ctx, http.MethodPost, "/api/v1/users", createBody, &created); err != nil {
 		return "", "", "", err
 	}
-	userID = cchScalarID(created.User.ID)
+	userID = cchScalarID(created.ID)
+	if userID == "" {
+		userID = cchScalarID(created.User.ID)
+	}
 	if userID == "" {
 		return "", "", "", errors.New("CCH create user response missing user id")
 	}
 	if created.DefaultKey != nil {
 		keyID = cchScalarID(created.DefaultKey.ID)
 		apiKey = strings.TrimSpace(created.DefaultKey.Key)
+	}
+	if keyID == "" && len(created.Keys) > 0 {
+		keyID = cchScalarID(created.Keys[0].ID)
+		apiKey = strings.TrimSpace(created.Keys[0].Key)
 	}
 	keyBody := map[string]any{
 		"name":          keyName,
@@ -513,6 +523,7 @@ func (h *Handler) GenerateContributionAPIKey(c *gin.Context) {
 
 	userID, keyID, apiKey, err := cfg.createContributorKey(ctx, keyName, email)
 	if err != nil {
+		log.Printf("generate contribution CCH API key failed: email=%s err=%v", email, err)
 		writeError(c, http.StatusBadGateway, "CCH api key generation failed")
 		return
 	}
