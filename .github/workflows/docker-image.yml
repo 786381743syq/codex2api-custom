@@ -2,6 +2,8 @@ name: Build Docker Image
 
 on:
   push:
+    branches:
+      - contribution-custom
     tags:
       - 'v*'
   workflow_dispatch:
@@ -49,6 +51,7 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
+            type=ref,event=branch
             type=semver,pattern={{version}},value=${{ inputs.build_version || github.ref_name }},enable=${{ inputs.build_version != '' || startsWith(github.ref, 'refs/tags/v') }}
             type=semver,pattern={{major}}.{{minor}},value=${{ inputs.build_version || github.ref_name }},enable=${{ inputs.build_version != '' || startsWith(github.ref, 'refs/tags/v') }}
             type=raw,value=latest

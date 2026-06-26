@@ -2,7 +2,7 @@ name: codex2api
 
 services:
   codex2api:
-    image: ghcr.io/james-6-23/codex2api:latest
+    image: ${CODEX_IMAGE:-ghcr.io/786381743syq/codex2api-custom:latest}
     container_name: codex2api
     ports:
       - "${BIND_HOST:-0.0.0.0}:${CODEX_PORT:-8080}:${CODEX_PORT:-8080}"
@@ -32,7 +32,7 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
     # ports:
-    #   - "5432:5432"   # 取消注释以便本地调试
+    #   - "5432:5432"   # Uncomment for local debugging
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${DATABASE_USER:-codex2api}"]
       interval: 5s
@@ -51,7 +51,7 @@ services:
     volumes:
       - redisdata:/data
     # ports:
-    #   - "6379:6379"   # 取消注释以便本地调试
+    #   - "6379:6379"   # Uncomment for local debugging
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
