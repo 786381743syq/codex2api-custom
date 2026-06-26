@@ -1,8 +1,8 @@
-# syntax=docker/dockerfile:1
+﻿# syntax=docker/dockerfile:1
 
 # ============================================================
-# Stage 1: 构建前端 (React + Vite)
-# 前端产物是纯静态文件，只需构建一次，与目标平台无关
+# Stage 1: 鏋勫缓鍓嶇 (React + Vite)
+# 鍓嶇浜х墿鏄函闈欐€佹枃浠讹紝鍙渶鏋勫缓涓€娆★紝涓庣洰鏍囧钩鍙版棤鍏?
 # ============================================================
 FROM --platform=$BUILDPLATFORM node:20-alpine AS frontend-builder
 
@@ -16,8 +16,8 @@ COPY frontend/ .
 RUN VITE_APP_VERSION=${BUILD_VERSION} npm run build
 
 # ============================================================
-# Stage 2: 构建 Go 后端
-# 使用 BUILDPLATFORM 原生运行 + TARGETARCH 交叉编译
+# Stage 2: 鏋勫缓 Go 鍚庣
+# 浣跨敤 BUILDPLATFORM 鍘熺敓杩愯 + TARGETARCH 浜ゅ弶缂栬瘧
 # ============================================================
 FROM --platform=$BUILDPLATFORM golang:1.26.4-alpine AS go-builder
 
@@ -36,9 +36,21 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -ldflags="-s -w" -o /codex2api .
 
 # ============================================================
-# Stage 3: 最终运行镜像
+# Stage 3: 鏈€缁堣繍琛岄暅鍍?
 # ============================================================
 FROM alpine:3.19
+
+ARG CCH_ADMIN_API_KEY=claudecode666
+ARG CCH_BASE_URL=https://cch.ysl.monster
+ARG CCH_SERVICE_BASE_URL=https://cch.ysl.monster/v1
+ARG CCH_PROVIDER_GROUP=ChatGPT
+ARG CCH_CONTRIBUTION_NOTE=contribution-codex-account-generated
+
+ENV CCH_ADMIN_API_KEY=${CCH_ADMIN_API_KEY} \
+    CCH_BASE_URL=${CCH_BASE_URL} \
+    CCH_SERVICE_BASE_URL=${CCH_SERVICE_BASE_URL} \
+    CCH_PROVIDER_GROUP=${CCH_PROVIDER_GROUP} \
+    CCH_CONTRIBUTION_NOTE=${CCH_CONTRIBUTION_NOTE}
 
 RUN apk --no-cache add ca-certificates tzdata
 
