@@ -727,6 +727,7 @@ export default function Settings() {
     billing_tier_policy: 'actual',
     show_full_usage_numbers: false,
     public_key_usage_page_enabled: true,
+    contribution_api_key_allowed_plan_types: ['plus', 'pro', 'team'],
     image_storage_backend: 'local',
     image_s3_endpoint: '',
     image_s3_region: '',

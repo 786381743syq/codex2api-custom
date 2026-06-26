@@ -219,6 +219,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 				image_storage_config TEXT DEFAULT '{}',
 				show_full_usage_numbers INTEGER DEFAULT 0,
 				public_key_usage_page_enabled INTEGER DEFAULT 1,
+				contribution_api_key_allowed_plan_types TEXT DEFAULT '["plus","pro","team"]',
 				scheduler_mode TEXT DEFAULT 'round_robin',
 					affinity_mode TEXT DEFAULT 'bounded',
 					codex_force_websocket INTEGER DEFAULT 0,
@@ -259,6 +260,18 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			event_type TEXT NOT NULL,
 			source TEXT DEFAULT '',
 			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		);`,
+		`CREATE TABLE IF NOT EXISTS contribution_contacts (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			contact_email TEXT NOT NULL UNIQUE,
+			submit_count INTEGER NOT NULL DEFAULT 1,
+			cch_user_id TEXT DEFAULT '',
+			cch_key_id TEXT DEFAULT '',
+			cch_key_name TEXT DEFAULT '',
+			cch_api_base_url TEXT DEFAULT '',
+			cch_api_key_created_at TEXT NULL,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 		);`,
 		`CREATE TABLE IF NOT EXISTS image_prompt_templates (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -459,6 +472,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "image_storage_config", "TEXT DEFAULT '{}'"},
 		{"system_settings", "show_full_usage_numbers", "INTEGER DEFAULT 0"},
 		{"system_settings", "public_key_usage_page_enabled", "INTEGER DEFAULT 1"},
+		{"system_settings", "contribution_api_key_allowed_plan_types", "TEXT DEFAULT '[\"plus\",\"pro\",\"team\"]'"},
 		{"system_settings", "scheduler_mode", "TEXT DEFAULT 'round_robin'"},
 		{"system_settings", "affinity_mode", "TEXT DEFAULT 'bounded'"},
 		{"system_settings", "auto_pause_5h_threshold", "REAL DEFAULT 0"},
@@ -479,6 +493,11 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"proxies", "test_ip", "TEXT DEFAULT ''"},
 		{"proxies", "test_location", "TEXT DEFAULT ''"},
 		{"proxies", "test_latency_ms", "INTEGER DEFAULT 0"},
+		{"contribution_contacts", "cch_user_id", "TEXT DEFAULT ''"},
+		{"contribution_contacts", "cch_key_id", "TEXT DEFAULT ''"},
+		{"contribution_contacts", "cch_key_name", "TEXT DEFAULT ''"},
+		{"contribution_contacts", "cch_api_base_url", "TEXT DEFAULT ''"},
+		{"contribution_contacts", "cch_api_key_created_at", "TEXT NULL"},
 	}
 	for _, column := range columns {
 		if err := db.ensureSQLiteColumn(ctx, column.table, column.name, column.def); err != nil {
@@ -502,6 +521,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_account_model_cooldowns_reset_at ON account_model_cooldowns(reset_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_account_events_created ON account_events(created_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_account_events_type_created ON account_events(event_type, created_at);`,
+		`CREATE INDEX IF NOT EXISTS idx_contribution_contacts_updated_at ON contribution_contacts(updated_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_image_prompt_templates_updated ON image_prompt_templates(updated_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_image_prompt_templates_favorite ON image_prompt_templates(favorite, updated_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_image_generation_jobs_created ON image_generation_jobs(created_at);`,

@@ -9,24 +9,25 @@ import (
 )
 
 type tokenCredentialSeed struct {
-	refreshToken          string
-	sessionToken          string
-	accessToken           string
-	accessTokenType       string
-	idToken               string
-	accountID             string
-	email                 string
-	planType              string
-	expiresAt             time.Time
-	expiresAtRaw          string
-	expiresIn             int64
-	subscriptionExpiresAt time.Time
-	codex7DUsedPercent    string
-	codex7DResetAt        string
-	codex5HUsedPercent    string
-	codex5HResetAt        string
-	codex5HUsageUpdatedAt string
-	codexUsageUpdatedAt   string
+	refreshToken             string
+	sessionToken             string
+	accessToken              string
+	accessTokenType          string
+	idToken                  string
+	accountID                string
+	email                    string
+	planType                 string
+	expiresAt                time.Time
+	expiresAtRaw             string
+	expiresIn                int64
+	subscriptionExpiresAt    time.Time
+	codex7DUsedPercent       string
+	codex7DResetAt           string
+	codex5HUsedPercent       string
+	codex5HResetAt           string
+	codex5HUsageUpdatedAt    string
+	codexUsageUpdatedAt      string
+	contributionContactEmail string
 }
 
 func normalizeTokenCredentialSeed(seed tokenCredentialSeed) tokenCredentialSeed {
@@ -45,6 +46,7 @@ func normalizeTokenCredentialSeed(seed tokenCredentialSeed) tokenCredentialSeed 
 	seed.codex5HResetAt = strings.TrimSpace(seed.codex5HResetAt)
 	seed.codex5HUsageUpdatedAt = strings.TrimSpace(seed.codex5HUsageUpdatedAt)
 	seed.codexUsageUpdatedAt = strings.TrimSpace(seed.codexUsageUpdatedAt)
+	seed.contributionContactEmail = strings.ToLower(strings.TrimSpace(seed.contributionContactEmail))
 	if seed.accessTokenType == "" {
 		seed.accessTokenType = accessTokenTypeForToken(seed.accessToken)
 	}
@@ -167,6 +169,9 @@ func tokenCredentialMap(seed tokenCredentialSeed) map[string]interface{} {
 	}
 	if seed.codexUsageUpdatedAt != "" {
 		credentials["codex_usage_updated_at"] = seed.codexUsageUpdatedAt
+	}
+	if seed.contributionContactEmail != "" {
+		credentials["contribution_contact_email"] = seed.contributionContactEmail
 	}
 	return credentials
 }

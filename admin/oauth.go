@@ -38,11 +38,12 @@ const (
 // ==================== 内存 Session 存储 ====================
 
 type oauthSession struct {
-	State        string
-	CodeVerifier string
-	RedirectURI  string
-	ProxyURL     string
-	CreatedAt    time.Time
+	State                    string
+	CodeVerifier             string
+	RedirectURI              string
+	ProxyURL                 string
+	ContributionContactEmail string
+	CreatedAt                time.Time
 
 	// 回调自动捕获字段
 	CallbackCode   string    // 回调收到的 authorization code
@@ -194,6 +195,154 @@ func (h *Handler) GenerateOAuthURL(c *gin.Context) {
 	})
 }
 
+// GenerateContributionOAuthURL starts a public account contribution OAuth session.
+func (h *Handler) GenerateContributionOAuthURL(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 4096)
+	var req struct {
+		Email string `json:"email"`
+		Name  string `json:"name"`
+	}
+	decoder := json.NewDecoder(c.Request.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	email, err := normalizeContactEmail(req.Email)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !h.allowContributionContactSubmit(c.ClientIP(), email+"|oauth") {
+		writeError(c, http.StatusTooManyRequests, "too many requests")
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+	if _, err := h.db.UpsertContributionContact(ctx, email); err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	state, err := oauthRandomHex(32)
+	if err != nil {
+		writeError(c, http.StatusInternalServerError, "failed to create state")
+		return
+	}
+	codeVerifier, err := oauthRandomHex(64)
+	if err != nil {
+		writeError(c, http.StatusInternalServerError, "failed to create code verifier")
+		return
+	}
+	sessionID, err := oauthRandomHex(16)
+	if err != nil {
+		writeError(c, http.StatusInternalServerError, "failed to create session")
+		return
+	}
+	globalOAuthStore.set(sessionID, &oauthSession{State: state, CodeVerifier: codeVerifier, RedirectURI: oauthDefaultRedirectURI, ContributionContactEmail: email, CreatedAt: time.Now()})
+	params := neturl.Values{}
+	params.Set("response_type", "code")
+	params.Set("client_id", oauthClientID)
+	params.Set("redirect_uri", oauthDefaultRedirectURI)
+	params.Set("scope", oauthDefaultScopes)
+	params.Set("state", state)
+	params.Set("code_challenge", oauthCodeChallenge(codeVerifier))
+	params.Set("code_challenge_method", "S256")
+	params.Set("id_token_add_organizations", "true")
+	params.Set("codex_cli_simplified_flow", "true")
+	c.JSON(http.StatusOK, gin.H{"auth_url": oauthAuthorizeURL + "?" + params.Encode(), "session_id": sessionID})
+}
+
+// ExchangeContributionOAuthCode completes a public contribution OAuth session.
+func (h *Handler) ExchangeContributionOAuthCode(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 4096)
+	var req struct {
+		Email     string `json:"email"`
+		SessionID string `json:"session_id"`
+		Code      string `json:"code"`
+		State     string `json:"state"`
+		Name      string `json:"name"`
+	}
+	decoder := json.NewDecoder(c.Request.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	email, err := normalizeContactEmail(req.Email)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	req.SessionID = strings.TrimSpace(req.SessionID)
+	req.Code = strings.TrimSpace(req.Code)
+	req.State = strings.TrimSpace(req.State)
+	if req.SessionID == "" || req.Code == "" || req.State == "" {
+		writeError(c, http.StatusBadRequest, "session_id, code and state are required")
+		return
+	}
+	if !h.allowContributionContactSubmit(c.ClientIP(), email+"|exchange") {
+		writeError(c, http.StatusTooManyRequests, "too many requests")
+		return
+	}
+	sess, ok := globalOAuthStore.get(req.SessionID)
+	if !ok {
+		writeError(c, http.StatusBadRequest, "oauth session expired")
+		return
+	}
+	if req.State != sess.State {
+		writeError(c, http.StatusBadRequest, "state mismatch")
+		return
+	}
+	if strings.ToLower(strings.TrimSpace(sess.ContributionContactEmail)) != email {
+		writeError(c, http.StatusBadRequest, "email does not match oauth session")
+		return
+	}
+	proxyURL := sess.ProxyURL
+	if proxyURL == "" && h.store != nil {
+		proxyURL = h.store.GetProxyURL()
+	}
+	resinTempID := "oauth-" + req.SessionID
+	tokenResp, accountInfo, err := doOAuthCodeExchange(c.Request.Context(), req.Code, sess.CodeVerifier, sess.RedirectURI, proxyURL, resinTempID)
+	if err != nil {
+		writeError(c, http.StatusBadGateway, "oauth exchange failed: "+err.Error())
+		return
+	}
+	globalOAuthStore.delete(req.SessionID)
+	if tokenResp.RefreshToken == "" {
+		writeError(c, http.StatusBadGateway, "refresh_token missing")
+		return
+	}
+	seed := normalizeTokenCredentialSeed(tokenCredentialSeed{refreshToken: tokenResp.RefreshToken, accessToken: tokenResp.AccessToken, idToken: tokenResp.IDToken, expiresIn: tokenResp.ExpiresIn, contributionContactEmail: email})
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+	name := strings.TrimSpace(req.Name)
+	if name == "" && seed.email != "" {
+		name = seed.email
+	}
+	if name == "" {
+		name = "oauth-account"
+	}
+	id, updated, err := h.upsertOAuthIdentityAccount(ctx, name, proxyURL, seed, "public_contribution_oauth")
+	if err != nil {
+		writeError(c, http.StatusInternalServerError, "account write failed: "+err.Error())
+		return
+	}
+	if proxy.IsResinEnabled() && !updated {
+		go proxy.InheritLease(resinTempID, fmt.Sprintf("%d", id))
+	}
+	accountEmail := seed.email
+	planType := seed.planType
+	if accountInfo != nil {
+		if accountInfo.Email != "" {
+			accountEmail = accountInfo.Email
+		}
+		if accountInfo.PlanType != "" {
+			planType = accountInfo.PlanType
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "message": "account contributed", "email": accountEmail, "plan_type": planType, "contributed": true, "count": 1})
+}
+
 // ExchangeOAuthCode 用授权码兑换 token，并写入新账号
 // POST /api/admin/oauth/exchange-code
 func (h *Handler) ExchangeOAuthCode(c *gin.Context) {
@@ -245,10 +394,11 @@ func (h *Handler) ExchangeOAuthCode(c *gin.Context) {
 		return
 	}
 	seed := normalizeTokenCredentialSeed(tokenCredentialSeed{
-		refreshToken: tokenResp.RefreshToken,
-		accessToken:  tokenResp.AccessToken,
-		idToken:      tokenResp.IDToken,
-		expiresIn:    tokenResp.ExpiresIn,
+		refreshToken:             tokenResp.RefreshToken,
+		accessToken:              tokenResp.AccessToken,
+		idToken:                  tokenResp.IDToken,
+		expiresIn:                tokenResp.ExpiresIn,
+		contributionContactEmail: sess.ContributionContactEmail,
 	})
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)

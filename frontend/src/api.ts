@@ -42,6 +42,10 @@ import type {
   SiteBranding,
   StatsResponse,
   SetupHintsResponse,
+  SubmitContributionContactResponse,
+  PublicContributionStatusResponse,
+  PublicContributionOAuthExchangeResponse,
+  PublicContributionAPIKeyResponse,
   CPAExportEntry,
   SystemSettings,
   UpdateAccountSchedulerRequest,
@@ -56,6 +60,8 @@ import type {
   AccountHealthBarsResponse,
   BatchUpdateAccountsRequest,
   BackgroundUploadResponse,
+  ContributionLookupResponse,
+  ContributionContactListResponse,
   CreateAccountGroupRequest,
   UpdateAccountGroupRequest,
 } from './types'
@@ -219,6 +225,41 @@ function buildOpsErrorSearchParams(params: {
 
 export const api = {
   getBranding: () => requestPublic<SiteBranding>('/api/branding'),
+  submitContributionContact: (email: string) =>
+    requestPublic<SubmitContributionContactResponse>('/api/contributions/contact', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email }),
+    }),
+  getPublicContributionStatus: (email: string) => {
+    const search = new URLSearchParams()
+    search.set('email', email)
+    return requestPublic<PublicContributionStatusResponse>(`/api/contributions/status?${search.toString()}`)
+  },
+  deletePublicContributionAccount: (id: number, email: string) =>
+    requestPublic<MessageResponse>(`/api/contributions/accounts/${id}`, {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email }),
+    }),
+  generateContributionOAuthURL: (data: { email: string; name?: string }) =>
+    requestPublic<OAuthURLResponse>('/api/contributions/oauth/generate-auth-url', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    }),
+  exchangeContributionOAuthCode: (data: { email: string; session_id: string; code: string; state: string; name?: string }) =>
+    requestPublic<PublicContributionOAuthExchangeResponse>('/api/contributions/oauth/exchange-code', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    }),
+  generateContributionAPIKey: (data: { email: string; key_name: string }) =>
+    requestPublic<PublicContributionAPIKeyResponse>('/api/contributions/api-key', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    }),
   getPublicAPIKeyUsage: (apiKey: string, range = '30d', params: { page?: number; pageSize?: number } = {}) => {
     const search = new URLSearchParams()
     search.set('range', range)
@@ -228,6 +269,18 @@ export const api = {
   },
   getStats: () => request<StatsResponse>('/stats'),
   getAccounts: () => request<AccountsResponse>('/accounts'),
+  listContributionContacts: (params: { page?: number; pageSize?: number; email?: string } = {}) => {
+    const search = new URLSearchParams()
+    if (params.page) search.set('page', String(params.page))
+    if (params.pageSize) search.set('page_size', String(params.pageSize))
+    if (params.email) search.set('email', params.email)
+    return request<ContributionContactListResponse>(`/contributions/contacts?${search.toString()}`)
+  },
+  checkContribution: (email: string) => {
+    const search = new URLSearchParams()
+    search.set('email', email)
+    return request<ContributionLookupResponse>(`/contributions/check?${search.toString()}`)
+  },
   addAccount: (data: AddAccountRequest) =>
     request<CreateAccountResponse>('/accounts', { method: 'POST', body: JSON.stringify(data) }),
   addATAccount: (data: AddATAccountRequest) =>

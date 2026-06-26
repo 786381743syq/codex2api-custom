@@ -28,9 +28,16 @@ Thumbs.db
 .env.local
 .env.bak.*
 .deploy/
+.local-tools/
 USAGE_WINDOW_LOGIC.md
 .claude/settings.local.json
 scripts
+
+# Local databases and generated backups
+*.db
+*.db-shm
+*.db-wal
+*.go.[0-9]*
 
 # Logs
 logs/

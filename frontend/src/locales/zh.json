@@ -1,5 +1,6 @@
 {
   "nav": {
+    "contributions": "贡献查询",
     "dashboard": "仪表盘",
     "accounts": "账号管理",
     "apiKeys": "API 密钥",
@@ -108,6 +109,33 @@
     "placeholder": "输入管理密钥…",
     "login": "进入控制台",
     "error": "密钥错误，请重试"
+  },
+  "contributions": {
+    "title": "贡献查询",
+    "description": "输入联系邮箱，查询该邮箱是否贡献过账号。",
+    "emailLabel": "联系邮箱",
+    "emailPlaceholder": "name@example.com",
+    "submit": "查询",
+    "checking": "查询中",
+    "invalidEmail": "请输入有效的邮箱地址",
+    "resultTitle": "查询结果",
+    "matched": "已贡献",
+    "notMatched": "未匹配",
+    "matchedDesc": "匹配到 {{count}} 个账号。",
+    "notMatchedDesc": "没有找到该邮箱贡献过的账号。",
+    "emptyTitle": "等待查询",
+    "emptyDesc": "输入邮箱后会在这里显示匹配结果。",
+    "accountList": "匹配账号",
+    "colAccount": "账号",
+    "colPlan": "套餐",
+    "colStatus": "状态",
+    "colCreated": "首次记录",
+    "colUpdated": "最近记录",
+    "colSubmitCount": "查询/提交次数",
+    "colContribution": "账号匹配",
+    "colApiKey": "API Key",
+    "apiKeyGenerated": "已生成",
+    "apiKeyNotGenerated": "未生成"
   },
   "dashboard": {
     "title": "仪表盘",

@@ -13,10 +13,12 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"mime"
 	"mime/multipart"
 	"net"
 	"net/http"
+	"net/mail"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -63,6 +65,10 @@ type Handler struct {
 	// 图表聚合内存缓存（10秒 TTL）
 	chartCacheMu   sync.RWMutex
 	chartCacheData map[string]*chartCacheEntry
+
+	contributionSubmitMu    sync.Mutex
+	contributionSubmitLast  map[string]time.Time
+	contributionAPIKeyLocks sync.Map
 
 	// 账号请求统计缓存（30秒 TTL）
 	reqCountMu        sync.RWMutex
@@ -232,19 +238,20 @@ func (h *Handler) getUsageStatsCached(ctx context.Context, rangeStart, rangeEnd 
 // NewHandler 创建管理后台处理器
 func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *proxy.RateLimiter, adminSecretEnv string) *Handler {
 	handler := &Handler{
-		store:          store,
-		cache:          tc,
-		db:             db,
-		rateLimiter:    rl,
-		cpuSampler:     newCPUSampler(),
-		startedAt:      time.Now(),
-		databaseDriver: db.Driver(),
-		databaseLabel:  db.Label(),
-		cacheDriver:    tc.Driver(),
-		cacheLabel:     tc.Label(),
-		adminSecretEnv: adminSecretEnv,
-		imageProxy:     proxy.NewHandler(store, db, nil, nil),
-		chartCacheData: make(map[string]*chartCacheEntry),
+		store:                  store,
+		cache:                  tc,
+		db:                     db,
+		rateLimiter:            rl,
+		cpuSampler:             newCPUSampler(),
+		startedAt:              time.Now(),
+		databaseDriver:         db.Driver(),
+		databaseLabel:          db.Label(),
+		cacheDriver:            tc.Driver(),
+		cacheLabel:             tc.Label(),
+		adminSecretEnv:         adminSecretEnv,
+		imageProxy:             proxy.NewHandler(store, db, nil, nil),
+		chartCacheData:         make(map[string]*chartCacheEntry),
+		contributionSubmitLast: make(map[string]time.Time),
 	}
 	if handler.imageProxy != nil {
 		handler.imageProxy.SetRuntimeCache(tc)
@@ -277,6 +284,13 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	keyUsage.GET("/summary", h.GetPublicAPIKeyUsageSummary)
 	keyUsage.GET("/me", h.GetPublicAPIKeyUsageSummary)
 
+	r.POST("/api/contributions/contact", h.SubmitContributionContact)
+	r.GET("/api/contributions/status", h.GetPublicContributionStatus)
+	r.DELETE("/api/contributions/accounts/:id", h.DeletePublicContributionAccount)
+	r.POST("/api/contributions/api-key", h.GenerateContributionAPIKey)
+	r.POST("/api/contributions/oauth/generate-auth-url", h.GenerateContributionOAuthURL)
+	r.POST("/api/contributions/oauth/exchange-code", h.ExchangeContributionOAuthCode)
+
 	// 首次初始化端点（无需鉴权，仅在系统未配置 ADMIN_SECRET 时可用）
 	// 这两个端点必须注册在 adminAuthMiddleware 之外，否则会被 fail-closed 拦截。
 	r.GET("/api/admin/bootstrap-status", h.GetBootstrapStatus)
@@ -286,6 +300,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.Use(h.adminAuthMiddleware())
 	api.GET("/stats", h.GetStats)
 	api.GET("/accounts", h.ListAccounts)
+	api.GET("/contributions/check", h.CheckContributionByEmail)
+	api.GET("/contributions/contacts", h.ListContributionContacts)
 	api.POST("/accounts", h.AddAccount)
 	api.POST("/accounts/at", h.AddATAccount)
 	api.POST("/accounts/openai-responses", h.AddOpenAIResponsesAccount)
@@ -622,6 +638,457 @@ type accountResponse struct {
 	ImageQuotaTotal     *int   `json:"image_quota_total,omitempty"`
 	TodayUsedCount      *int   `json:"today_used_count,omitempty"`
 	ImageQuotaResetAt   string `json:"image_quota_reset_at,omitempty"`
+}
+
+type contributionAccountResponse struct {
+	ID                    int64    `json:"id"`
+	Name                  string   `json:"name"`
+	Email                 string   `json:"email"`
+	PlanType              string   `json:"plan_type"`
+	Status                string   `json:"status"`
+	UsagePercent7d        *float64 `json:"usage_percent_7d"`
+	UsagePercent5h        *float64 `json:"usage_percent_5h"`
+	Reset7dAt             string   `json:"reset_7d_at,omitempty"`
+	Reset5hAt             string   `json:"reset_5h_at,omitempty"`
+	RateLimitResetCredits *int     `json:"rate_limit_reset_credits"`
+	CodexUsageUpdatedAt   string   `json:"codex_usage_updated_at,omitempty"`
+	Codex5HUsageUpdatedAt string   `json:"codex_5h_usage_updated_at,omitempty"`
+	CreatedAt             string   `json:"created_at"`
+	UpdatedAt             string   `json:"updated_at"`
+	DeletedAt             string   `json:"deleted_at,omitempty"`
+}
+
+type contributionLookupResponse struct {
+	Email           string                        `json:"email"`
+	Contributed     bool                          `json:"contributed"`
+	Count           int                           `json:"count"`
+	Accounts        []contributionAccountResponse `json:"accounts"`
+	ContactRecorded bool                          `json:"contact_recorded"`
+	Contact         *contributionContactResponse  `json:"contact,omitempty"`
+}
+
+type contributionContactResponse struct {
+	Email       string `json:"email"`
+	SubmitCount int    `json:"submit_count"`
+	CreatedAt   string `json:"created_at"`
+	UpdatedAt   string `json:"updated_at"`
+}
+
+type contributionContactListItemResponse struct {
+	Email               string `json:"email"`
+	SubmitCount         int    `json:"submit_count"`
+	CreatedAt           string `json:"created_at"`
+	UpdatedAt           string `json:"updated_at"`
+	Contributed         bool   `json:"contributed"`
+	MatchedAccountCount int    `json:"matched_account_count"`
+	APIKeyGenerated     bool   `json:"api_key_generated"`
+	APIKeyName          string `json:"api_key_name,omitempty"`
+	APIKeyCreatedAt     string `json:"api_key_created_at,omitempty"`
+}
+
+type contributionContactListResponse struct {
+	Items    []contributionContactListItemResponse `json:"items"`
+	Total    int                                   `json:"total"`
+	Page     int                                   `json:"page"`
+	PageSize int                                   `json:"page_size"`
+}
+
+type submitContributionContactRequest struct {
+	Email string `json:"email"`
+}
+
+type deletePublicContributionAccountRequest struct {
+	Email string `json:"email"`
+}
+type submitContributionContactResponse struct {
+	OK      bool   `json:"ok"`
+	Message string `json:"message"`
+}
+type publicContributionStatusResponse struct {
+	Email                    string                              `json:"email"`
+	Contributed              bool                                `json:"contributed"`
+	Count                    int                                 `json:"count"`
+	Accounts                 []contributionAccountResponse       `json:"accounts"`
+	ContactRecorded          bool                                `json:"contact_recorded"`
+	APIKeyEligible           bool                                `json:"api_key_eligible"`
+	APIKeyEligibilityMessage string                              `json:"api_key_eligibility_message,omitempty"`
+	APIKeyAllowedPlanTypes   []string                            `json:"api_key_allowed_plan_types"`
+	APIKey                   *generateContributionAPIKeyResponse `json:"api_key,omitempty"`
+}
+
+func normalizeContactEmail(input string) (string, error) {
+	email := strings.ToLower(strings.TrimSpace(input))
+	if email == "" {
+		return "", errors.New("email is required")
+	}
+	if len(email) > 254 || strings.ContainsAny(email, " \t\r\n<>") {
+		return "", errors.New("invalid email")
+	}
+	addr, err := mail.ParseAddress(email)
+	if err != nil || strings.ToLower(strings.TrimSpace(addr.Address)) != email {
+		return "", errors.New("invalid email")
+	}
+	at := strings.LastIndex(email, "@")
+	if at <= 0 || at == len(email)-1 || !strings.Contains(email[at+1:], ".") {
+		return "", errors.New("invalid email")
+	}
+	return email, nil
+}
+
+func contributionContactFromRow(row *database.ContributionContactRow) *contributionContactResponse {
+	if row == nil {
+		return nil
+	}
+	return &contributionContactResponse{Email: row.Email, SubmitCount: row.SubmitCount, CreatedAt: row.CreatedAt.Format(time.RFC3339), UpdatedAt: row.UpdatedAt.Format(time.RFC3339)}
+}
+
+func optionalFloatFromString(raw string) *float64 {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	value, err := strconv.ParseFloat(raw, 64)
+	if err != nil || math.IsNaN(value) || math.IsInf(value, 0) {
+		return nil
+	}
+	return &value
+}
+
+func optionalIntFromString(raw string) *int {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	if value, err := strconv.Atoi(raw); err == nil {
+		return &value
+	}
+	floatValue, err := strconv.ParseFloat(raw, 64)
+	if err != nil || math.IsNaN(floatValue) || math.IsInf(floatValue, 0) {
+		return nil
+	}
+	value := int(floatValue)
+	return &value
+}
+
+func contributionAccountFromRow(row *database.AccountContributionRow) contributionAccountResponse {
+	item := contributionAccountResponse{
+		ID:                    row.ID,
+		Name:                  row.Name,
+		Email:                 row.Email,
+		PlanType:              row.PlanType,
+		Status:                row.Status,
+		UsagePercent7d:        optionalFloatFromString(row.UsagePercent7d),
+		UsagePercent5h:        optionalFloatFromString(row.UsagePercent5h),
+		Reset7dAt:             row.Reset7dAt,
+		Reset5hAt:             row.Reset5hAt,
+		RateLimitResetCredits: optionalIntFromString(row.RateLimitResetCredits),
+		CodexUsageUpdatedAt:   row.CodexUsageUpdatedAt,
+		Codex5HUsageUpdatedAt: row.Codex5HUsageUpdatedAt,
+		CreatedAt:             row.CreatedAt.Format(time.RFC3339),
+		UpdatedAt:             row.UpdatedAt.Format(time.RFC3339),
+	}
+	if row.DeletedAt.Valid {
+		item.DeletedAt = row.DeletedAt.Time.Format(time.RFC3339)
+	}
+	return item
+}
+
+func contributionAccountsFromRows(rows []*database.AccountContributionRow) []contributionAccountResponse {
+	accounts := make([]contributionAccountResponse, 0, len(rows))
+	for _, row := range rows {
+		if row == nil {
+			continue
+		}
+		accounts = append(accounts, contributionAccountFromRow(row))
+	}
+	if accounts == nil {
+		return []contributionAccountResponse{}
+	}
+	return accounts
+}
+
+func (h *Handler) allowContributionContactSubmit(ip string, email string) bool {
+	if h == nil {
+		return true
+	}
+	key := strings.TrimSpace(ip) + "|" + email
+	now := time.Now()
+	h.contributionSubmitMu.Lock()
+	defer h.contributionSubmitMu.Unlock()
+	if h.contributionSubmitLast == nil {
+		h.contributionSubmitLast = make(map[string]time.Time)
+	}
+	if len(h.contributionSubmitLast) > 10000 {
+		for k, last := range h.contributionSubmitLast {
+			if now.Sub(last) > time.Minute {
+				delete(h.contributionSubmitLast, k)
+			}
+		}
+	}
+	if last, ok := h.contributionSubmitLast[key]; ok && now.Sub(last) < 10*time.Second {
+		return false
+	}
+	h.contributionSubmitLast[key] = now
+	return true
+}
+
+func (h *Handler) SubmitContributionContact(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 4096)
+	var req submitContributionContactRequest
+	decoder := json.NewDecoder(c.Request.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "invalid email")
+		return
+	}
+	email, err := normalizeContactEmail(req.Email)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !h.allowContributionContactSubmit(c.ClientIP(), email) {
+		writeError(c, http.StatusTooManyRequests, "提交太频繁，请稍后再试")
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+	if _, err := h.db.UpsertContributionContact(ctx, email); err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, submitContributionContactResponse{OK: true, Message: "contact email recorded"})
+}
+
+func (h *Handler) GetPublicContributionStatus(c *gin.Context) {
+	email, err := normalizeContactEmail(c.Query("email"))
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 20*time.Second)
+	defer cancel()
+	rows, err := h.db.FindAccountsByEmail(ctx, email)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	accounts := contributionAccountsFromRows(rows)
+	contactRow, err := h.db.FindContributionContactByEmail(ctx, email)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		writeInternalError(c, err)
+		return
+	}
+	allowedPlanTypes, err := h.contributionAPIKeyAllowedPlanTypes(ctx)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	apiKeyEligible := contributionAccountsAllowAPIKey(rows, allowedPlanTypes)
+	apiKeyEligibilityMessage := ""
+	if len(accounts) > 0 && !apiKeyEligible {
+		apiKeyEligibilityMessage = contributionAPIKeyIneligibleMessage(allowedPlanTypes)
+	}
+	var apiKey *generateContributionAPIKeyResponse
+	if contactRow != nil && strings.TrimSpace(contactRow.CCHKeyID) != "" {
+		cfg := contributionCCHConfig()
+		keyExists := false
+		if apiKeyEligible {
+			keyExists = true
+			if err := cfg.setContributorAccessEnabled(ctx, contactRow.CCHUserID, contactRow.CCHKeyID, true); err != nil {
+				if !isCCHNotFound(err) {
+					writeError(c, http.StatusBadGateway, "existing CCH api key cannot be enabled")
+					return
+				}
+				keyExists = false
+			}
+		} else {
+			if err := cfg.setContributorAccessEnabled(ctx, contactRow.CCHUserID, contactRow.CCHKeyID, false); err != nil && !isCCHNotFound(err) {
+				writeError(c, http.StatusBadGateway, "existing CCH api key cannot be disabled")
+				return
+			}
+		}
+		if keyExists {
+			apiKey, err = contributionAPIKeyResponseFromContact(ctx, cfg, contactRow, "")
+			if err != nil {
+				if !isCCHNotFound(err) {
+					writeError(c, http.StatusBadGateway, "existing CCH api key cannot be loaded")
+					return
+				}
+				apiKey = nil
+			}
+		}
+	}
+	c.JSON(http.StatusOK, publicContributionStatusResponse{Email: email, Contributed: len(accounts) > 0, Count: len(accounts), Accounts: accounts, ContactRecorded: contactRow != nil, APIKeyEligible: apiKeyEligible, APIKeyEligibilityMessage: apiKeyEligibilityMessage, APIKeyAllowedPlanTypes: allowedPlanTypes, APIKey: apiKey})
+}
+
+func (h *Handler) ListContributionContacts(c *gin.Context) {
+	page := 1
+	if raw := strings.TrimSpace(c.Query("page")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 {
+			writeError(c, http.StatusBadRequest, "page 必须是正整数")
+			return
+		}
+		page = parsed
+	}
+	pageSize := 20
+	if raw := strings.TrimSpace(c.Query("page_size")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 || parsed > 500 {
+			writeError(c, http.StatusBadRequest, "page_size 必须是 1 到 500 之间的整数")
+			return
+		}
+		pageSize = parsed
+	}
+	email := strings.ToLower(strings.TrimSpace(c.Query("email")))
+	if email != "" && (len(email) > 254 || strings.ContainsAny(email, " \t\r\n<>")) {
+		writeError(c, http.StatusBadRequest, "邮箱格式无效")
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+	rows, total, err := h.db.ListContributionContacts(ctx, page, pageSize, email)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	items := make([]contributionContactListItemResponse, 0, len(rows))
+	for _, row := range rows {
+		if row == nil {
+			continue
+		}
+		item := contributionContactListItemResponse{
+			Email:               row.Email,
+			SubmitCount:         row.SubmitCount,
+			CreatedAt:           row.CreatedAt.Format(time.RFC3339),
+			UpdatedAt:           row.UpdatedAt.Format(time.RFC3339),
+			Contributed:         row.MatchedAccountCount > 0,
+			MatchedAccountCount: row.MatchedAccountCount,
+			APIKeyGenerated:     strings.TrimSpace(row.CCHKeyID) != "",
+			APIKeyName:          row.CCHKeyName,
+		}
+		if !row.CCHAPIKeyCreatedAt.IsZero() {
+			item.APIKeyCreatedAt = row.CCHAPIKeyCreatedAt.Format(time.RFC3339)
+		}
+		items = append(items, item)
+	}
+	if items == nil {
+		items = []contributionContactListItemResponse{}
+	}
+	c.JSON(http.StatusOK, contributionContactListResponse{Items: items, Total: total, Page: page, PageSize: pageSize})
+}
+
+func (h *Handler) CheckContributionByEmail(c *gin.Context) {
+	email, err := normalizeContactEmail(c.Query("email"))
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+	rows, err := h.db.FindAccountsByEmail(ctx, email)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	contactRow, err := h.db.FindContributionContactByEmail(ctx, email)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		writeInternalError(c, err)
+		return
+	}
+	accounts := contributionAccountsFromRows(rows)
+	c.JSON(http.StatusOK, contributionLookupResponse{Email: email, Contributed: len(accounts) > 0, Count: len(accounts), Accounts: accounts, ContactRecorded: contactRow != nil, Contact: contributionContactFromRow(contactRow)})
+}
+
+func (h *Handler) DeletePublicContributionAccount(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || id <= 0 {
+		writeError(c, http.StatusBadRequest, "invalid account id")
+		return
+	}
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 4096)
+	var req deletePublicContributionAccountRequest
+	decoder := json.NewDecoder(c.Request.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "invalid email")
+		return
+	}
+	email, err := normalizeContactEmail(req.Email)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	unlockAPIKey := h.lockContributionAPIKey(email)
+	defer unlockAPIKey()
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+	rows, err := h.db.FindAccountsByEmail(ctx, email)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	matched := false
+	for _, row := range rows {
+		if row != nil && row.ID == id {
+			matched = true
+			break
+		}
+	}
+	if !matched {
+		writeError(c, http.StatusNotFound, "account not found for this email")
+		return
+	}
+
+	remainingRows := contributionAccountsExcludingID(rows, id)
+	allowedPlanTypes, err := h.contributionAPIKeyAllowedPlanTypes(ctx)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	apiKeyDisabled := false
+	var disabledUserID string
+	var disabledKeyID string
+	if !contributionAccountsAllowAPIKey(remainingRows, allowedPlanTypes) {
+		contactRow, err := h.db.FindContributionContactByEmail(ctx, email)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			writeInternalError(c, err)
+			return
+		}
+		if contactRow != nil && strings.TrimSpace(contactRow.CCHKeyID) != "" {
+			disabledUserID = contactRow.CCHUserID
+			disabledKeyID = contactRow.CCHKeyID
+			if err := contributionCCHConfig().setContributorAccessEnabled(ctx, disabledUserID, disabledKeyID, false); err != nil {
+				if isCCHNotFound(err) {
+					h.clearContributionContactCCHKey(ctx, email, disabledKeyID, "cch_not_found")
+				} else {
+					writeError(c, http.StatusBadGateway, "CCH api key cannot be disabled")
+					return
+				}
+			}
+			apiKeyDisabled = true
+		}
+	}
+	if err := h.deleteAccountByID(ctx, id); err != nil {
+		if apiKeyDisabled {
+			if enableErr := contributionCCHConfig().setContributorAccessEnabled(context.Background(), disabledUserID, disabledKeyID, true); enableErr != nil {
+				log.Printf("restore CCH API key enabled state failed: key_id=%s err=%v", disabledKeyID, enableErr)
+			}
+		}
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(c, http.StatusNotFound, "account not found")
+			return
+		}
+		writeError(c, http.StatusInternalServerError, "delete failed: "+err.Error())
+		return
+	}
+	security.SecurityAuditLog("PUBLIC_CONTRIBUTION_ACCOUNT_DELETED", fmt.Sprintf("account_id=%d email=%s cch_api_key_disabled=%t ip=%s", id, email, apiKeyDisabled, c.ClientIP()))
+	if apiKeyDisabled {
+		writeMessage(c, http.StatusOK, "account deleted and api key disabled")
+		return
+	}
+	writeMessage(c, http.StatusOK, "account deleted")
 }
 
 type modelCooldownResponse struct {
@@ -5142,95 +5609,96 @@ func (h *Handler) DeleteAPIKey(c *gin.Context) {
 // ==================== Settings ====================
 
 type settingsResponse struct {
-	SiteName                           string  `json:"site_name"`
-	SiteLogo                           string  `json:"site_logo"`
-	BackgroundImage                    string  `json:"background_image"`
-	BackgroundOpacity                  int     `json:"background_opacity"`
-	BackgroundBlur                     int     `json:"background_blur"`
-	BackgroundGlassOpacity             int     `json:"background_glass_opacity"`
-	BackgroundGlassBlur                int     `json:"background_glass_blur"`
-	MaxConcurrency                     int     `json:"max_concurrency"`
-	GlobalRPM                          int     `json:"global_rpm"`
-	TestModel                          string  `json:"test_model"`
-	TestConcurrency                    int     `json:"test_concurrency"`
-	BackgroundRefreshIntervalMinutes   int     `json:"background_refresh_interval_minutes"`
-	UsageProbeMaxAgeMinutes            int     `json:"usage_probe_max_age_minutes"`
-	UsageProbeConcurrency              int     `json:"usage_probe_concurrency"`
-	UsageProbeResponsesFallbackEnabled bool    `json:"usage_probe_responses_fallback_enabled"`
-	RecoveryProbeIntervalMinutes       int     `json:"recovery_probe_interval_minutes"`
-	LazyMode                           bool    `json:"lazy_mode"`
-	ProxyURL                           string  `json:"proxy_url"`
-	PgMaxConns                         int     `json:"pg_max_conns"`
-	RedisPoolSize                      int     `json:"redis_pool_size"`
-	AutoCleanUnauthorized              bool    `json:"auto_clean_unauthorized"`
-	AutoCleanRateLimited               bool    `json:"auto_clean_rate_limited"`
-	AdminSecret                        string  `json:"admin_secret"`
-	AdminAuthSource                    string  `json:"admin_auth_source"`
-	AutoCleanFullUsage                 bool    `json:"auto_clean_full_usage"`
-	AutoCleanError                     bool    `json:"auto_clean_error"`
-	AutoCleanExpired                   bool    `json:"auto_clean_expired"`
-	ProxyPoolEnabled                   bool    `json:"proxy_pool_enabled"`
-	FastSchedulerEnabled               bool    `json:"fast_scheduler_enabled"`
-	CodexForceWebsocket                bool    `json:"codex_force_websocket"`
-	CodexWSKeepaliveEnabled            bool    `json:"codex_ws_keepalive_enabled"`
-	CodexWSKeepaliveIntervalSec        int     `json:"codex_ws_keepalive_interval_sec"`
-	CodexWSHideUpstreamErrors          bool    `json:"codex_ws_hide_upstream_errors"`
-	CodexWSSilentRetryEnabled          bool    `json:"codex_ws_silent_retry_enabled"`
-	CodexWSSilentMaxRetries            int     `json:"codex_ws_silent_max_retries"`
-	SchedulerMode                      string  `json:"scheduler_mode"`
-	AffinityMode                       string  `json:"affinity_mode"`
-	MaxRetries                         int     `json:"max_retries"`
-	MaxRateLimitRetries                int     `json:"max_rate_limit_retries"`
-	AllowRemoteMigration               bool    `json:"allow_remote_migration"`
-	DatabaseDriver                     string  `json:"database_driver"`
-	DatabaseLabel                      string  `json:"database_label"`
-	CacheDriver                        string  `json:"cache_driver"`
-	CacheLabel                         string  `json:"cache_label"`
-	ExpiredCleaned                     int     `json:"expired_cleaned,omitempty"`
-	ModelMapping                       string  `json:"model_mapping"`
-	CodexModelMapping                  string  `json:"codex_model_mapping"`
-	ReasoningEffortModels              string  `json:"reasoning_effort_models"`
-	ResinURL                           string  `json:"resin_url"`
-	ResinPlatformName                  string  `json:"resin_platform_name"`
-	PromptFilterEnabled                bool    `json:"prompt_filter_enabled"`
-	PromptFilterMode                   string  `json:"prompt_filter_mode"`
-	PromptFilterThreshold              int     `json:"prompt_filter_threshold"`
-	PromptFilterStrictThreshold        int     `json:"prompt_filter_strict_threshold"`
-	PromptFilterLogMatches             bool    `json:"prompt_filter_log_matches"`
-	PromptFilterMaxTextLength          int     `json:"prompt_filter_max_text_length"`
-	PromptFilterSensitiveWords         string  `json:"prompt_filter_sensitive_words"`
-	PromptFilterCustomPatterns         string  `json:"prompt_filter_custom_patterns"`
-	PromptFilterDisabledPatterns       string  `json:"prompt_filter_disabled_patterns"`
-	PromptFilterReviewEnabled          bool    `json:"prompt_filter_review_enabled"`
-	PromptFilterReviewAPIKeyConfigured bool    `json:"prompt_filter_review_api_key_configured"`
-	PromptFilterReviewBaseURL          string  `json:"prompt_filter_review_base_url"`
-	PromptFilterReviewModel            string  `json:"prompt_filter_review_model"`
-	PromptFilterReviewTimeoutSeconds   int     `json:"prompt_filter_review_timeout_seconds"`
-	PromptFilterReviewFailClosed       bool    `json:"prompt_filter_review_fail_closed"`
-	ClientCompatMode                   string  `json:"client_compat_mode"`
-	CodexMinCLIVersion                 string  `json:"codex_min_cli_version"`
-	UsageLogMode                       string  `json:"usage_log_mode"`
-	UsageLogBatchSize                  int     `json:"usage_log_batch_size"`
-	UsageLogFlushIntervalSeconds       int     `json:"usage_log_flush_interval_seconds"`
-	StreamFlushPolicy                  string  `json:"stream_flush_policy"`
-	StreamFlushIntervalMS              int     `json:"stream_flush_interval_ms"`
-	FirstTokenMode                     string  `json:"first_token_mode"`
-	FirstTokenTimeoutSeconds           int     `json:"first_token_timeout_seconds"`
-	BillingTierPolicy                  string  `json:"billing_tier_policy"`
-	ShowFullUsageNumbers               bool    `json:"show_full_usage_numbers"`
-	PublicKeyUsagePageEnabled          bool    `json:"public_key_usage_page_enabled"`
-	ImageStorageBackend                string  `json:"image_storage_backend"`
-	ImageS3Endpoint                    string  `json:"image_s3_endpoint"`
-	ImageS3Region                      string  `json:"image_s3_region"`
-	ImageS3Bucket                      string  `json:"image_s3_bucket"`
-	ImageS3AccessKey                   string  `json:"image_s3_access_key"`
-	ImageS3SecretKey                   string  `json:"image_s3_secret_key"`
-	ImageS3Prefix                      string  `json:"image_s3_prefix"`
-	ImageS3ForcePathStyle              bool    `json:"image_s3_force_path_style"`
-	AutoPause5hThreshold               float64 `json:"auto_pause_5h_threshold"`
-	AutoPause7dThreshold               float64 `json:"auto_pause_7d_threshold"`
-	AutoPause5hGuardBandPercent        float64 `json:"auto_pause_5h_guard_band_percent"`
-	AutoPause5hGuardConcurrency        int     `json:"auto_pause_5h_guard_concurrency"`
+	SiteName                           string   `json:"site_name"`
+	SiteLogo                           string   `json:"site_logo"`
+	BackgroundImage                    string   `json:"background_image"`
+	BackgroundOpacity                  int      `json:"background_opacity"`
+	BackgroundBlur                     int      `json:"background_blur"`
+	BackgroundGlassOpacity             int      `json:"background_glass_opacity"`
+	BackgroundGlassBlur                int      `json:"background_glass_blur"`
+	MaxConcurrency                     int      `json:"max_concurrency"`
+	GlobalRPM                          int      `json:"global_rpm"`
+	TestModel                          string   `json:"test_model"`
+	TestConcurrency                    int      `json:"test_concurrency"`
+	BackgroundRefreshIntervalMinutes   int      `json:"background_refresh_interval_minutes"`
+	UsageProbeMaxAgeMinutes            int      `json:"usage_probe_max_age_minutes"`
+	UsageProbeConcurrency              int      `json:"usage_probe_concurrency"`
+	UsageProbeResponsesFallbackEnabled bool     `json:"usage_probe_responses_fallback_enabled"`
+	RecoveryProbeIntervalMinutes       int      `json:"recovery_probe_interval_minutes"`
+	LazyMode                           bool     `json:"lazy_mode"`
+	ProxyURL                           string   `json:"proxy_url"`
+	PgMaxConns                         int      `json:"pg_max_conns"`
+	RedisPoolSize                      int      `json:"redis_pool_size"`
+	AutoCleanUnauthorized              bool     `json:"auto_clean_unauthorized"`
+	AutoCleanRateLimited               bool     `json:"auto_clean_rate_limited"`
+	AdminSecret                        string   `json:"admin_secret"`
+	AdminAuthSource                    string   `json:"admin_auth_source"`
+	AutoCleanFullUsage                 bool     `json:"auto_clean_full_usage"`
+	AutoCleanError                     bool     `json:"auto_clean_error"`
+	AutoCleanExpired                   bool     `json:"auto_clean_expired"`
+	ProxyPoolEnabled                   bool     `json:"proxy_pool_enabled"`
+	FastSchedulerEnabled               bool     `json:"fast_scheduler_enabled"`
+	CodexForceWebsocket                bool     `json:"codex_force_websocket"`
+	CodexWSKeepaliveEnabled            bool     `json:"codex_ws_keepalive_enabled"`
+	CodexWSKeepaliveIntervalSec        int      `json:"codex_ws_keepalive_interval_sec"`
+	CodexWSHideUpstreamErrors          bool     `json:"codex_ws_hide_upstream_errors"`
+	CodexWSSilentRetryEnabled          bool     `json:"codex_ws_silent_retry_enabled"`
+	CodexWSSilentMaxRetries            int      `json:"codex_ws_silent_max_retries"`
+	SchedulerMode                      string   `json:"scheduler_mode"`
+	AffinityMode                       string   `json:"affinity_mode"`
+	MaxRetries                         int      `json:"max_retries"`
+	MaxRateLimitRetries                int      `json:"max_rate_limit_retries"`
+	AllowRemoteMigration               bool     `json:"allow_remote_migration"`
+	DatabaseDriver                     string   `json:"database_driver"`
+	DatabaseLabel                      string   `json:"database_label"`
+	CacheDriver                        string   `json:"cache_driver"`
+	CacheLabel                         string   `json:"cache_label"`
+	ExpiredCleaned                     int      `json:"expired_cleaned,omitempty"`
+	ModelMapping                       string   `json:"model_mapping"`
+	CodexModelMapping                  string   `json:"codex_model_mapping"`
+	ReasoningEffortModels              string   `json:"reasoning_effort_models"`
+	ResinURL                           string   `json:"resin_url"`
+	ResinPlatformName                  string   `json:"resin_platform_name"`
+	PromptFilterEnabled                bool     `json:"prompt_filter_enabled"`
+	PromptFilterMode                   string   `json:"prompt_filter_mode"`
+	PromptFilterThreshold              int      `json:"prompt_filter_threshold"`
+	PromptFilterStrictThreshold        int      `json:"prompt_filter_strict_threshold"`
+	PromptFilterLogMatches             bool     `json:"prompt_filter_log_matches"`
+	PromptFilterMaxTextLength          int      `json:"prompt_filter_max_text_length"`
+	PromptFilterSensitiveWords         string   `json:"prompt_filter_sensitive_words"`
+	PromptFilterCustomPatterns         string   `json:"prompt_filter_custom_patterns"`
+	PromptFilterDisabledPatterns       string   `json:"prompt_filter_disabled_patterns"`
+	PromptFilterReviewEnabled          bool     `json:"prompt_filter_review_enabled"`
+	PromptFilterReviewAPIKeyConfigured bool     `json:"prompt_filter_review_api_key_configured"`
+	PromptFilterReviewBaseURL          string   `json:"prompt_filter_review_base_url"`
+	PromptFilterReviewModel            string   `json:"prompt_filter_review_model"`
+	PromptFilterReviewTimeoutSeconds   int      `json:"prompt_filter_review_timeout_seconds"`
+	PromptFilterReviewFailClosed       bool     `json:"prompt_filter_review_fail_closed"`
+	ClientCompatMode                   string   `json:"client_compat_mode"`
+	CodexMinCLIVersion                 string   `json:"codex_min_cli_version"`
+	UsageLogMode                       string   `json:"usage_log_mode"`
+	UsageLogBatchSize                  int      `json:"usage_log_batch_size"`
+	UsageLogFlushIntervalSeconds       int      `json:"usage_log_flush_interval_seconds"`
+	StreamFlushPolicy                  string   `json:"stream_flush_policy"`
+	StreamFlushIntervalMS              int      `json:"stream_flush_interval_ms"`
+	FirstTokenMode                     string   `json:"first_token_mode"`
+	FirstTokenTimeoutSeconds           int      `json:"first_token_timeout_seconds"`
+	BillingTierPolicy                  string   `json:"billing_tier_policy"`
+	ShowFullUsageNumbers               bool     `json:"show_full_usage_numbers"`
+	PublicKeyUsagePageEnabled          bool     `json:"public_key_usage_page_enabled"`
+	ContributionAPIKeyAllowedPlanTypes []string `json:"contribution_api_key_allowed_plan_types"`
+	ImageStorageBackend                string   `json:"image_storage_backend"`
+	ImageS3Endpoint                    string   `json:"image_s3_endpoint"`
+	ImageS3Region                      string   `json:"image_s3_region"`
+	ImageS3Bucket                      string   `json:"image_s3_bucket"`
+	ImageS3AccessKey                   string   `json:"image_s3_access_key"`
+	ImageS3SecretKey                   string   `json:"image_s3_secret_key"`
+	ImageS3Prefix                      string   `json:"image_s3_prefix"`
+	ImageS3ForcePathStyle              bool     `json:"image_s3_force_path_style"`
+	AutoPause5hThreshold               float64  `json:"auto_pause_5h_threshold"`
+	AutoPause7dThreshold               float64  `json:"auto_pause_7d_threshold"`
+	AutoPause5hGuardBandPercent        float64  `json:"auto_pause_5h_guard_band_percent"`
+	AutoPause5hGuardConcurrency        int      `json:"auto_pause_5h_guard_concurrency"`
 }
 
 type updateSettingsReq struct {
@@ -5305,6 +5773,7 @@ type updateSettingsReq struct {
 	BillingTierPolicy                  *string  `json:"billing_tier_policy"`
 	ShowFullUsageNumbers               *bool    `json:"show_full_usage_numbers"`
 	PublicKeyUsagePageEnabled          *bool    `json:"public_key_usage_page_enabled"`
+	ContributionAPIKeyAllowedPlanTypes []string `json:"contribution_api_key_allowed_plan_types"`
 	ImageStorageBackend                *string  `json:"image_storage_backend"`
 	ImageS3Endpoint                    *string  `json:"image_s3_endpoint"`
 	ImageS3Region                      *string  `json:"image_s3_region"`
@@ -5792,6 +6261,11 @@ func (h *Handler) GetSettings(c *gin.Context) {
 	branding := brandingFromSettings(dbSettings)
 	showFullUsageNumbers := false
 	publicKeyUsagePageEnabled := true
+	contributionAllowedPlanTypes, err := h.db.GetContributionAPIKeyAllowedPlanTypes(ctx)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
 	if dbSettings != nil && adminAuthSource != "env" {
 		adminSecret = dbSettings.AdminSecret
 	}
@@ -5886,6 +6360,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		BillingTierPolicy:                  runtimeCfg.BillingTierPolicy,
 		ShowFullUsageNumbers:               showFullUsageNumbers,
 		PublicKeyUsagePageEnabled:          publicKeyUsagePageEnabled,
+		ContributionAPIKeyAllowedPlanTypes: contributionAllowedPlanTypes,
 		ImageStorageBackend:                imgCfg.Backend,
 		ImageS3Endpoint:                    imgCfg.Endpoint,
 		ImageS3Region:                      imgCfg.Region,
@@ -5940,6 +6415,12 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	bgCfg := defaultBackgroundConfig()
 	showFullUsageNumbers := false
 	publicKeyUsagePageEnabled := true
+	contributionAllowedPlanTypes, err := h.db.GetContributionAPIKeyAllowedPlanTypes(c.Request.Context())
+	contributionAllowedPlanTypesChanged := false
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
 	existingSettings, _ := h.db.GetSystemSettings(c.Request.Context())
 	if existingSettings != nil {
 		currentAdminSecret = existingSettings.AdminSecret
@@ -6310,6 +6791,18 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		showFullUsageNumbers = *req.ShowFullUsageNumbers
 		log.Printf("设置已更新: show_full_usage_numbers = %t", showFullUsageNumbers)
 	}
+	if req.ContributionAPIKeyAllowedPlanTypes != nil {
+		normalized := database.NormalizeContributionAPIKeyAllowedPlanTypes(req.ContributionAPIKeyAllowedPlanTypes)
+		if len(normalized) == 0 {
+			writeError(c, http.StatusBadRequest, "contribution_api_key_allowed_plan_types is required")
+			return
+		}
+		if !reflect.DeepEqual(contributionAllowedPlanTypes, normalized) {
+			contributionAllowedPlanTypesChanged = true
+		}
+		contributionAllowedPlanTypes = normalized
+	}
+
 	if req.PublicKeyUsagePageEnabled != nil {
 		publicKeyUsagePageEnabled = *req.PublicKeyUsagePageEnabled
 		log.Printf("设置已更新: public_key_usage_page_enabled = %t", publicKeyUsagePageEnabled)
@@ -6532,7 +7025,11 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	}
 
 	// 持久化保存到数据库
-	err := h.db.UpdateSystemSettings(c.Request.Context(), &database.SystemSettings{
+	if _, err := h.db.UpdateContributionAPIKeyAllowedPlanTypes(c.Request.Context(), contributionAllowedPlanTypes); err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	err = h.db.UpdateSystemSettings(c.Request.Context(), &database.SystemSettings{
 		SiteName:                           siteName,
 		SiteLogo:                           siteLogo,
 		MaxConcurrency:                     h.store.GetMaxConcurrency(),
@@ -6623,6 +7120,10 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		adminSecretForDisplay = ""
 	}
 
+	if contributionAllowedPlanTypesChanged {
+		h.syncContributionCCHKeysAsync(contributionAllowedPlanTypes)
+	}
+
 	c.JSON(http.StatusOK, settingsResponse{
 		SiteName:                           siteName,
 		SiteLogo:                           siteLogo,
@@ -6700,6 +7201,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		FirstTokenTimeoutSeconds:           runtimeCfg.FirstTokenTimeoutSec,
 		BillingTierPolicy:                  runtimeCfg.BillingTierPolicy,
 		ShowFullUsageNumbers:               showFullUsageNumbers,
+		PublicKeyUsagePageEnabled:          publicKeyUsagePageEnabled,
+		ContributionAPIKeyAllowedPlanTypes: contributionAllowedPlanTypes,
 		ImageStorageBackend:                imgCfg.Backend,
 		ImageS3Endpoint:                    imgCfg.Endpoint,
 		ImageS3Region:                      imgCfg.Region,

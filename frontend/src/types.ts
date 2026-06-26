@@ -113,6 +113,94 @@ export interface AccountRow {
 
 export type AccountsResponse = ApiListResponse<'accounts', AccountRow>
 
+export interface ContributionLookupAccount {
+  id: number
+  name: string
+  email: string
+  plan_type: string
+  status: AccountStatus
+  usage_percent_7d?: number | null
+  usage_percent_5h?: number | null
+  reset_7d_at?: ISODateString
+  reset_5h_at?: ISODateString
+  rate_limit_reset_credits?: number | null
+  codex_usage_updated_at?: ISODateString
+  codex_5h_usage_updated_at?: ISODateString
+  created_at: ISODateString
+  updated_at: ISODateString
+  deleted_at?: ISODateString
+  last_test_status?: string
+  last_test_at?: ISODateString
+}
+
+export interface ContributionLookupResponse {
+  email: string
+  contributed: boolean
+  count: number
+  accounts: ContributionLookupAccount[]
+  contact_recorded: boolean
+  contact?: ContributionContactRecord
+}
+
+export interface ContributionContactRecord {
+  email: string
+  submit_count: number
+  created_at: ISODateString
+  updated_at: ISODateString
+}
+
+export interface ContributionContactListItem extends ContributionContactRecord {
+  contributed: boolean
+  matched_account_count: number
+  api_key_generated: boolean
+  api_key_name?: string
+  api_key_created_at?: ISODateString
+}
+
+export interface ContributionContactListResponse {
+  items: ContributionContactListItem[]
+  total: number
+  page: number
+  page_size: number
+}
+
+export interface SubmitContributionContactResponse {
+  ok: boolean
+  message: string
+}
+
+export interface PublicContributionStatusResponse {
+  email: string
+  contributed: boolean
+  count: number
+  accounts: ContributionLookupAccount[]
+  contact_recorded: boolean
+  api_key_eligible: boolean
+  api_key_eligibility_message?: string
+  api_key_allowed_plan_types: string[]
+  api_key?: PublicContributionAPIKeyResponse | null
+}
+
+export interface PublicContributionOAuthExchangeResponse {
+  ok: boolean
+  message: string
+  email: string
+  plan_type: string
+  contributed: boolean
+  count: number
+}
+
+export interface PublicContributionAPIKeyResponse {
+  api_key: string
+  base_url: string
+  key_name: string
+  provider_group: string
+  user_id: string
+  key_id: string
+  already_created: boolean
+  created_at: ISODateString
+}
+
 // AccountHealthBucket 是「健康状态」条单个时间窗口内的请求成败计数。
 export interface AccountHealthBucket {
   success: number
@@ -695,6 +783,7 @@ export interface SystemSettings {
   billing_tier_policy: 'actual' | 'requested' | string
   show_full_usage_numbers: boolean
   public_key_usage_page_enabled: boolean
+  contribution_api_key_allowed_plan_types: string[]
   image_storage_backend: 'local' | 's3' | string
   image_s3_endpoint: string
   image_s3_region: string

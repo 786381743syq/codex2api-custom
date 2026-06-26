@@ -51,6 +51,54 @@ type AccountModelCooldownRow struct {
 	UpdatedAt time.Time
 }
 
+type AccountContributionRow struct {
+	ID                    int64
+	Name                  string
+	Email                 string
+	PlanType              string
+	Status                string
+	UsagePercent7d        string
+	UsagePercent5h        string
+	Reset7dAt             string
+	Reset5hAt             string
+	RateLimitResetCredits string
+	CodexUsageUpdatedAt   string
+	Codex5HUsageUpdatedAt string
+	CreatedAt             time.Time
+	UpdatedAt             time.Time
+	DeletedAt             sql.NullTime
+}
+
+type ContributionContactRow struct {
+	ID                 int64
+	Email              string
+	SubmitCount        int
+	CCHUserID          string
+	CCHKeyID           string
+	CCHKeyName         string
+	CCHAPIBaseURL      string
+	CCHAPIKeyCreatedAt time.Time
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
+}
+
+type ContributionContactListItem struct {
+	Email               string
+	SubmitCount         int
+	CreatedAt           time.Time
+	UpdatedAt           time.Time
+	MatchedAccountCount int
+	CCHKeyID            string
+	CCHKeyName          string
+	CCHAPIKeyCreatedAt  time.Time
+}
+type ContributionContactKeyRow struct {
+	Email      string
+	CCHUserID  string
+	CCHKeyID   string
+	CCHKeyName string
+}
+
 type OptionalInt64Slice struct {
 	Set    bool
 	Values []int64
@@ -778,6 +826,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS image_storage_config TEXT DEFAULT '{}';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS show_full_usage_numbers BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS public_key_usage_page_enabled BOOLEAN DEFAULT TRUE;
+ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS contribution_api_key_allowed_plan_types TEXT DEFAULT '["plus","pro","team"]';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_force_websocket BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_ws_keepalive_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_ws_keepalive_interval_sec INT DEFAULT 60;
@@ -859,6 +908,25 @@ func (db *DB) migrate(ctx context.Context) error {
 	CREATE INDEX IF NOT EXISTS idx_account_events_created ON account_events(created_at);
 	CREATE INDEX IF NOT EXISTS idx_account_events_type_created ON account_events(event_type, created_at);
 
+	CREATE TABLE IF NOT EXISTS contribution_contacts (
+		id SERIAL PRIMARY KEY,
+		contact_email VARCHAR(254) NOT NULL UNIQUE,
+		submit_count INTEGER NOT NULL DEFAULT 1,
+		cch_user_id VARCHAR(64) DEFAULT '',
+		cch_key_id VARCHAR(64) DEFAULT '',
+		cch_key_name VARCHAR(255) DEFAULT '',
+		cch_api_base_url TEXT DEFAULT '',
+		cch_api_key_created_at TIMESTAMPTZ NULL,
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	);
+	ALTER TABLE contribution_contacts ADD COLUMN IF NOT EXISTS cch_user_id VARCHAR(64) DEFAULT '';
+	ALTER TABLE contribution_contacts ADD COLUMN IF NOT EXISTS cch_key_id VARCHAR(64) DEFAULT '';
+	ALTER TABLE contribution_contacts ADD COLUMN IF NOT EXISTS cch_key_name VARCHAR(255) DEFAULT '';
+	ALTER TABLE contribution_contacts ADD COLUMN IF NOT EXISTS cch_api_base_url TEXT DEFAULT '';
+	ALTER TABLE contribution_contacts ADD COLUMN IF NOT EXISTS cch_api_key_created_at TIMESTAMPTZ NULL;
+	CREATE INDEX IF NOT EXISTS idx_contribution_contacts_updated_at ON contribution_contacts(updated_at);
+
 	CREATE TABLE IF NOT EXISTS image_prompt_templates (
 		id            SERIAL PRIMARY KEY,
 		name          VARCHAR(255) NOT NULL DEFAULT '',
@@ -935,7 +1003,7 @@ func (db *DB) migrate(ctx context.Context) error {
 			FROM information_schema.columns
 			WHERE table_schema = current_schema()
 			  AND data_type = 'timestamp without time zone'
-			  AND table_name IN ('accounts', 'usage_logs', 'api_keys', 'proxies', 'account_events')
+			  AND table_name IN ('accounts', 'usage_logs', 'api_keys', 'proxies', 'account_events', 'contribution_contacts')
 		LOOP
 			EXECUTE format(
 				'ALTER TABLE %I ALTER COLUMN %I TYPE TIMESTAMPTZ USING %I AT TIME ZONE current_setting(''TIMEZONE'')',
@@ -1697,6 +1765,106 @@ func normalizeAffinityMode(mode string) string {
 	default:
 		return "bounded"
 	}
+}
+
+var DefaultContributionAPIKeyAllowedPlanTypes = []string{"plus", "pro", "team"}
+
+func NormalizeContributionAPIKeyAllowedPlanTypes(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	normalized := make([]string, 0, len(values))
+	for _, value := range values {
+		item := strings.ToLower(strings.TrimSpace(value))
+		if item == "" || len(item) > 64 {
+			continue
+		}
+		valid := true
+		for _, r := range item {
+			if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' || r == '-' || r == '.' {
+				continue
+			}
+			valid = false
+			break
+		}
+		if !valid {
+			continue
+		}
+		if _, ok := seen[item]; ok {
+			continue
+		}
+		seen[item] = struct{}{}
+		normalized = append(normalized, item)
+		if len(normalized) >= 64 {
+			break
+		}
+	}
+	return normalized
+}
+
+func defaultContributionAPIKeyAllowedPlanTypes() []string {
+	return append([]string(nil), DefaultContributionAPIKeyAllowedPlanTypes...)
+}
+
+func encodeContributionAPIKeyAllowedPlanTypes(values []string) string {
+	normalized := NormalizeContributionAPIKeyAllowedPlanTypes(values)
+	if len(normalized) == 0 {
+		normalized = defaultContributionAPIKeyAllowedPlanTypes()
+	}
+	data, err := json.Marshal(normalized)
+	if err != nil {
+		return `[` + `"plus","pro","team"` + `]`
+	}
+	return string(data)
+}
+
+func decodeContributionAPIKeyAllowedPlanTypes(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return defaultContributionAPIKeyAllowedPlanTypes()
+	}
+	var values []string
+	if err := json.Unmarshal([]byte(raw), &values); err != nil {
+		values = strings.Split(raw, ",")
+	}
+	normalized := NormalizeContributionAPIKeyAllowedPlanTypes(values)
+	if len(normalized) == 0 {
+		return defaultContributionAPIKeyAllowedPlanTypes()
+	}
+	return normalized
+}
+
+func (db *DB) GetContributionAPIKeyAllowedPlanTypes(ctx context.Context) ([]string, error) {
+	var raw string
+	err := db.conn.QueryRowContext(ctx, `
+		SELECT COALESCE(contribution_api_key_allowed_plan_types, '["plus","pro","team"]')
+		FROM system_settings WHERE id = 1
+	`).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return defaultContributionAPIKeyAllowedPlanTypes(), nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return decodeContributionAPIKeyAllowedPlanTypes(raw), nil
+}
+
+func (db *DB) UpdateContributionAPIKeyAllowedPlanTypes(ctx context.Context, values []string) ([]string, error) {
+	normalized := NormalizeContributionAPIKeyAllowedPlanTypes(values)
+	if len(normalized) == 0 {
+		return nil, errors.New("contribution api key allowed plan types is required")
+	}
+	raw := encodeContributionAPIKeyAllowedPlanTypes(normalized)
+	err := db.withSQLiteWriteLock(ctx, func() error {
+		_, err := db.conn.ExecContext(ctx, `
+			INSERT INTO system_settings (id, contribution_api_key_allowed_plan_types)
+			VALUES (1, $1)
+			ON CONFLICT(id) DO UPDATE SET contribution_api_key_allowed_plan_types = EXCLUDED.contribution_api_key_allowed_plan_types
+		`, raw)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return normalized, nil
 }
 
 // DeleteAPIKey 删除 API 密钥
@@ -3887,6 +4055,292 @@ func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
 		accounts = append(accounts, a)
 	}
 	return accounts, rows.Err()
+}
+
+func (db *DB) FindAccountsByEmail(ctx context.Context, email string) ([]*AccountContributionRow, error) {
+	email = strings.ToLower(strings.TrimSpace(email))
+	if email == "" {
+		return []*AccountContributionRow{}, nil
+	}
+	rows, err := db.conn.QueryContext(ctx, `
+		SELECT id, name, credentials, status, created_at, updated_at, deleted_at
+		FROM accounts
+		WHERE deleted_at IS NULL
+		ORDER BY id
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("query contribution accounts failed: %w", err)
+	}
+	defer rows.Close()
+
+	result := make([]*AccountContributionRow, 0)
+	for rows.Next() {
+		var id int64
+		var name string
+		var credentials interface{}
+		var status string
+		var createdAtRaw interface{}
+		var updatedAtRaw interface{}
+		var deletedAtRaw interface{}
+		if err := rows.Scan(&id, &name, &credentials, &status, &createdAtRaw, &updatedAtRaw, &deletedAtRaw); err != nil {
+			return nil, fmt.Errorf("scan contribution account failed: %w", err)
+		}
+		accountEmail := strings.ToLower(strings.TrimSpace(credentialString(credentials, "email")))
+		contactEmail := strings.ToLower(strings.TrimSpace(credentialString(credentials, "contribution_contact_email")))
+		if accountEmail != email && contactEmail != email {
+			continue
+		}
+		createdAt, err := parseDBTimeValue(createdAtRaw)
+		if err != nil {
+			return nil, err
+		}
+		updatedAt, err := parseDBTimeValue(updatedAtRaw)
+		if err != nil {
+			return nil, err
+		}
+		deletedAt, err := parseDBNullTimeValue(deletedAtRaw)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, &AccountContributionRow{
+			ID:                    id,
+			Name:                  name,
+			Email:                 accountEmail,
+			PlanType:              strings.TrimSpace(credentialString(credentials, "plan_type")),
+			Status:                status,
+			UsagePercent7d:        strings.TrimSpace(credentialString(credentials, "codex_7d_used_percent")),
+			UsagePercent5h:        strings.TrimSpace(credentialString(credentials, "codex_5h_used_percent")),
+			Reset7dAt:             strings.TrimSpace(credentialString(credentials, "codex_7d_reset_at")),
+			Reset5hAt:             strings.TrimSpace(credentialString(credentials, "codex_5h_reset_at")),
+			RateLimitResetCredits: strings.TrimSpace(credentialString(credentials, "rate_limit_reset_credits")),
+			CodexUsageUpdatedAt:   strings.TrimSpace(credentialString(credentials, "codex_usage_updated_at")),
+			Codex5HUsageUpdatedAt: strings.TrimSpace(credentialString(credentials, "codex_5h_usage_updated_at")),
+			CreatedAt:             createdAt,
+			UpdatedAt:             updatedAt,
+			DeletedAt:             deletedAt,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (db *DB) AccountContributionCountByEmail(ctx context.Context, email string) (int, error) {
+	rows, err := db.FindAccountsByEmail(ctx, email)
+	if err != nil {
+		return 0, err
+	}
+	return len(rows), nil
+}
+
+func (db *DB) UpsertContributionContact(ctx context.Context, email string) (*ContributionContactRow, error) {
+	email = strings.ToLower(strings.TrimSpace(email))
+	if email == "" {
+		return nil, sql.ErrNoRows
+	}
+	query := `
+		INSERT INTO contribution_contacts (contact_email, submit_count)
+		VALUES ($1, 1)
+		ON CONFLICT(contact_email) DO UPDATE SET
+			submit_count = contribution_contacts.submit_count + 1,
+			updated_at = CURRENT_TIMESTAMP
+		RETURNING id, contact_email, submit_count, COALESCE(cch_user_id, ''), COALESCE(cch_key_id, ''), COALESCE(cch_key_name, ''), COALESCE(cch_api_base_url, ''), cch_api_key_created_at, created_at, updated_at
+	`
+	var contact *ContributionContactRow
+	err := db.withSQLiteWriteLock(ctx, func() error {
+		row, err := db.scanContributionContact(ctx, query, email)
+		if err != nil {
+			return err
+		}
+		contact = row
+		return nil
+	})
+	return contact, err
+}
+
+func (db *DB) FindContributionContactByEmail(ctx context.Context, email string) (*ContributionContactRow, error) {
+	email = strings.ToLower(strings.TrimSpace(email))
+	if email == "" {
+		return nil, sql.ErrNoRows
+	}
+	return db.scanContributionContact(ctx, `
+		SELECT id, contact_email, submit_count, COALESCE(cch_user_id, ''), COALESCE(cch_key_id, ''), COALESCE(cch_key_name, ''), COALESCE(cch_api_base_url, ''), cch_api_key_created_at, created_at, updated_at
+		FROM contribution_contacts
+		WHERE contact_email = $1
+	`, email)
+}
+
+func (db *DB) UpdateContributionContactCCHKey(ctx context.Context, email string, userID string, keyID string, keyName string, apiBaseURL string, createdAt time.Time) error {
+	email = strings.ToLower(strings.TrimSpace(email))
+	if email == "" || strings.TrimSpace(userID) == "" || strings.TrimSpace(keyID) == "" {
+		return sql.ErrNoRows
+	}
+	if createdAt.IsZero() {
+		createdAt = time.Now()
+	}
+	return db.withSQLiteWriteLock(ctx, func() error {
+		_, err := db.conn.ExecContext(ctx, `
+			INSERT INTO contribution_contacts (contact_email, submit_count, cch_user_id, cch_key_id, cch_key_name, cch_api_base_url, cch_api_key_created_at, updated_at)
+			VALUES ($1, 1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP)
+			ON CONFLICT(contact_email) DO UPDATE SET
+				cch_user_id = EXCLUDED.cch_user_id,
+				cch_key_id = EXCLUDED.cch_key_id,
+				cch_key_name = EXCLUDED.cch_key_name,
+				cch_api_base_url = EXCLUDED.cch_api_base_url,
+				cch_api_key_created_at = EXCLUDED.cch_api_key_created_at,
+				updated_at = CURRENT_TIMESTAMP
+		`, email, userID, keyID, keyName, apiBaseURL, db.timeArg(createdAt))
+		return err
+	})
+}
+
+func (db *DB) ClearContributionContactCCHKey(ctx context.Context, email string, keyID string) error {
+	email = strings.ToLower(strings.TrimSpace(email))
+	keyID = strings.TrimSpace(keyID)
+	if email == "" || keyID == "" {
+		return sql.ErrNoRows
+	}
+	return db.withSQLiteWriteLock(ctx, func() error {
+		res, err := db.conn.ExecContext(ctx, `
+			UPDATE contribution_contacts
+			SET cch_user_id = '', cch_key_id = '', cch_key_name = '', cch_api_base_url = '', cch_api_key_created_at = NULL, updated_at = CURRENT_TIMESTAMP
+			WHERE contact_email = $1 AND cch_key_id = $2
+		`, email, keyID)
+		if err != nil {
+			return err
+		}
+		if affected, err := res.RowsAffected(); err == nil && affected == 0 {
+			return sql.ErrNoRows
+		}
+		return nil
+	})
+}
+
+func (db *DB) ListContributionContactsWithCCHKeys(ctx context.Context) ([]*ContributionContactKeyRow, error) {
+	rows, err := db.conn.QueryContext(ctx, `
+		SELECT contact_email, COALESCE(cch_user_id, ''), COALESCE(cch_key_id, ''), COALESCE(cch_key_name, '')
+		FROM contribution_contacts
+		WHERE COALESCE(cch_key_id, '') <> ''
+		ORDER BY id
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make([]*ContributionContactKeyRow, 0)
+	for rows.Next() {
+		item := &ContributionContactKeyRow{}
+		if err := rows.Scan(&item.Email, &item.CCHUserID, &item.CCHKeyID, &item.CCHKeyName); err != nil {
+			return nil, err
+		}
+		item.Email = strings.ToLower(strings.TrimSpace(item.Email))
+		item.CCHUserID = strings.TrimSpace(item.CCHUserID)
+		item.CCHKeyID = strings.TrimSpace(item.CCHKeyID)
+		item.CCHKeyName = strings.TrimSpace(item.CCHKeyName)
+		if item.Email != "" && item.CCHKeyID != "" {
+			result = append(result, item)
+		}
+	}
+	return result, rows.Err()
+}
+func (db *DB) scanContributionContact(ctx context.Context, query string, args ...interface{}) (*ContributionContactRow, error) {
+	row := &ContributionContactRow{}
+	var keyCreatedRaw interface{}
+	var createdRaw interface{}
+	var updatedRaw interface{}
+	if err := db.conn.QueryRowContext(ctx, query, args...).Scan(&row.ID, &row.Email, &row.SubmitCount, &row.CCHUserID, &row.CCHKeyID, &row.CCHKeyName, &row.CCHAPIBaseURL, &keyCreatedRaw, &createdRaw, &updatedRaw); err != nil {
+		return nil, err
+	}
+	var err error
+	row.CCHAPIKeyCreatedAt, err = parseDBTimeValue(keyCreatedRaw)
+	if err != nil {
+		return nil, err
+	}
+	row.CreatedAt, err = parseDBTimeValue(createdRaw)
+	if err != nil {
+		return nil, err
+	}
+	row.UpdatedAt, err = parseDBTimeValue(updatedRaw)
+	if err != nil {
+		return nil, err
+	}
+	return row, nil
+}
+
+func (db *DB) ListContributionContacts(ctx context.Context, page, pageSize int, email string) ([]*ContributionContactListItem, int, error) {
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 {
+		pageSize = 20
+	}
+	if pageSize > 500 {
+		pageSize = 500
+	}
+	email = strings.ToLower(strings.TrimSpace(email))
+	where := ""
+	args := make([]interface{}, 0, 3)
+	if email != "" {
+		where = "WHERE LOWER(contact_email) LIKE $1"
+		args = append(args, "%"+email+"%")
+	}
+	countQuery := "SELECT COUNT(*) FROM contribution_contacts " + where
+	var total int
+	if err := db.conn.QueryRowContext(ctx, countQuery, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	if total == 0 {
+		return []*ContributionContactListItem{}, 0, nil
+	}
+	offset := (page - 1) * pageSize
+	listArgs := append([]interface{}{}, args...)
+	listArgs = append(listArgs, pageSize, offset)
+	limitPlaceholder := fmt.Sprintf("$%d", len(args)+1)
+	offsetPlaceholder := fmt.Sprintf("$%d", len(args)+2)
+	rows, err := db.conn.QueryContext(ctx, `
+		SELECT contact_email, submit_count, COALESCE(cch_key_id, ''), COALESCE(cch_key_name, ''), cch_api_key_created_at, created_at, updated_at
+		FROM contribution_contacts
+		`+where+`
+		ORDER BY updated_at DESC, id DESC
+		LIMIT `+limitPlaceholder+` OFFSET `+offsetPlaceholder, listArgs...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	items := make([]*ContributionContactListItem, 0, pageSize)
+	for rows.Next() {
+		item := &ContributionContactListItem{}
+		var keyCreatedRaw interface{}
+		var createdRaw interface{}
+		var updatedRaw interface{}
+		if err := rows.Scan(&item.Email, &item.SubmitCount, &item.CCHKeyID, &item.CCHKeyName, &keyCreatedRaw, &createdRaw, &updatedRaw); err != nil {
+			return nil, 0, err
+		}
+		item.CCHAPIKeyCreatedAt, err = parseDBTimeValue(keyCreatedRaw)
+		if err != nil {
+			return nil, 0, err
+		}
+		item.CreatedAt, err = parseDBTimeValue(createdRaw)
+		if err != nil {
+			return nil, 0, err
+		}
+		item.UpdatedAt, err = parseDBTimeValue(updatedRaw)
+		if err != nil {
+			return nil, 0, err
+		}
+		item.Email = strings.ToLower(strings.TrimSpace(item.Email))
+		count, err := db.AccountContributionCountByEmail(ctx, item.Email)
+		if err != nil {
+			return nil, 0, err
+		}
+		item.MatchedAccountCount = count
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	return items, total, nil
 }
 
 func (db *DB) ListActiveModelCooldowns(ctx context.Context) ([]*AccountModelCooldownRow, error) {

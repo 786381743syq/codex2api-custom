@@ -10,6 +10,8 @@ import { ThemeProvider } from './hooks/useTheme'
 import Dashboard from './pages/Dashboard'
 
 const Accounts = lazy(() => import('./pages/Accounts'))
+const ContributionLookup = lazy(() => import('./pages/ContributionLookup'))
+const PublicContribution = lazy(() => import('./pages/PublicContribution'))
 const Operations = lazy(() => import('./pages/Operations'))
 const OperationsErrors = lazy(() => import('./pages/OperationsErrors'))
 const RuntimeStatus = lazy(() => import('./pages/RuntimeStatus'))
@@ -35,6 +37,7 @@ export default function App() {
               <Routes>
                 <Route path="/key-usage" element={<Navigate to="/key-usage/overview" replace />} />
                 <Route path="/key-usage/:view" element={<APIKeyUsagePortal />} />
+                <Route path="/contribute" element={<PublicContribution />} />
                 <Route path="/*" element={<AdminApp />} />
               </Routes>
             </Suspense>
@@ -52,6 +55,7 @@ function AdminApp() {
         <Routes>
           <Route path="/" element={<Dashboard />} />
           <Route path="/accounts" element={<Accounts />} />
+          <Route path="/contributions" element={<ContributionLookup />} />
           <Route path="/api-keys" element={<APIKeys />} />
           <Route path="/proxies" element={<Proxies />} />
           <Route path="/images" element={<Navigate to="/images/studio" replace />} />
