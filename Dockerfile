@@ -40,18 +40,6 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # ============================================================
 FROM alpine:3.19
 
-ARG CCH_ADMIN_API_KEY=claudecode666
-ARG CCH_BASE_URL=https://cch.ysl.monster
-ARG CCH_SERVICE_BASE_URL=https://cch.ysl.monster/v1
-ARG CCH_PROVIDER_GROUP=ChatGPT
-ARG CCH_CONTRIBUTION_NOTE=contribution-codex-account-generated
-
-ENV CCH_ADMIN_API_KEY=${CCH_ADMIN_API_KEY} \
-    CCH_BASE_URL=${CCH_BASE_URL} \
-    CCH_SERVICE_BASE_URL=${CCH_SERVICE_BASE_URL} \
-    CCH_PROVIDER_GROUP=${CCH_PROVIDER_GROUP} \
-    CCH_CONTRIBUTION_NOTE=${CCH_CONTRIBUTION_NOTE}
-
 RUN apk --no-cache add ca-certificates tzdata
 
 COPY --from=go-builder /codex2api /usr/local/bin/codex2api
