@@ -185,6 +185,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	explicitSessionID := ResolveExplicitSessionID(c.Request.Header, rawBody)
 	apiKeyID := requestAPIKeyID(c)
 	affinityKey := sessionAffinityKey(sessionID, apiKeyID)
+	respCacheOwner := responseCacheOwner(apiKeyID)
 	reasoningEffort := extractReasoningEffort(rawBody)
 	serviceTier := extractServiceTier(rawBody)
 	if serviceTier != "" {
@@ -279,9 +280,9 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		lastUpstreamCancel = upstreamCancel
 		ttftGuard := newFirstTokenTimeoutGuard(currentFirstTokenTimeout(), upstreamCancel)
 		useWebsocket := !forceHTTPAfterWSMessageTooBig
-		// 显式生图请求改走 HTTP 上游（客户端仍是 WS）：WebSocket 上游传输大体积
-		// 图片数据会卡死（issue #220）。
-		if useWebsocket && explicitlyRequestsImageGeneration(rawBody) {
+		// 生图请求改走 HTTP 上游（客户端仍是 WS）：WebSocket 上游传输大体积
+		// 图片数据会卡死（issue #220）；自然语言生图意图也需保留图片工具（issue #288）。
+		if useWebsocket && rawResponsesBodyShouldForceHTTPForImageGeneration(rawBody) {
 			useWebsocket = false
 		}
 		// WebSocket 上游下剥离自动注入的图片工具，防止模型自主生图卡死。
@@ -422,7 +423,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			return newResponsesWSCloseError(websocket.CloseTryAgainLater, clientErr.Message, apiErr)
 		}
 
-		if err := h.streamResponsesWSUpstream(c, conn, resp, account, proxyURL, affinityKey, logModel, effectiveModel, logEffectiveModel, reasoningEffort, serviceTier, expandedInputRaw, start, ttftGuard, silentRetryEnabled, hideUpstreamErrors, useWebsocket); err != nil {
+		if err := h.streamResponsesWSUpstream(c, conn, resp, account, proxyURL, affinityKey, logModel, effectiveModel, logEffectiveModel, reasoningEffort, serviceTier, respCacheOwner, expandedInputRaw, start, ttftGuard, silentRetryEnabled, hideUpstreamErrors, useWebsocket); err != nil {
 			var retryErr *responsesWSRetryableStreamError
 			if errors.As(err, &retryErr) {
 				lastRetryableUpstreamErr = api.NewAPIError(api.ErrCodeUpstreamError, retryErr.outcome.failureMessage, api.ErrorTypeUpstream)
@@ -469,6 +470,7 @@ func (h *Handler) streamResponsesWSUpstream(
 	logEffectiveModel string,
 	reasoningEffort string,
 	serviceTier string,
+	respCacheOwner string,
 	expandedInputRaw string,
 	start time.Time,
 	ttftGuard *firstTokenTimeoutGuard,
@@ -534,7 +536,7 @@ func (h *Handler) streamResponsesWSUpstream(
 			if tier := parsed.Get("response.service_tier").String(); tier != "" {
 				actualServiceTier = tier
 			}
-			cacheCompletedResponse([]byte(expandedInputRaw), data)
+			cacheCompletedResponse(respCacheOwner, []byte(expandedInputRaw), data)
 			gotTerminal = true
 		}
 		if eventType == "response.failed" {

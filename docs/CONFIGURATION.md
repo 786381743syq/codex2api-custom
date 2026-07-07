@@ -58,7 +58,7 @@ Codex2API 采用三层配置架构：
 | `CODEX_PROXY_URL` | 否 | - | 全局代理 URL，适用于需要为所有 Codex 上游请求统一配置代理的场景 |
 | `USE_WEBSOCKET` | 否 | `false` | 旧版开关；未设置 `CODEX_UPSTREAM_TRANSPORT` 时，`true` 等价于 `CODEX_UPSTREAM_TRANSPORT=ws` |
 | `CODEX_TRANSPORT_MODE` | 否 | `standard` | Codex HTTP transport：默认标准 Go TLS；`utls_chrome` 可回滚旧 Chrome uTLS 行为 |
-| `CODEX_WS_SEND_USER_AGENT` | 否 | `false` | WS 握手是否发送 `User-Agent`/`Version`；默认关闭 |
+| `CODEX_WS_SEND_USER_AGENT` | 否 | `true` | WS 握手是否发送 Codex `User-Agent`/`Version`；设为 `false` 可关闭 |
 | `CODEX_SESSION_AFFINITY_TTL` | 否 | `1h` | Codex 会话到账号/代理的黏性 TTL，支持 `1h`、`90m` 或秒数 |
 | `CODEX_FINGERPRINT_DEBUG` | 否 | `false` | 输出脱敏指纹策略诊断日志，不记录 token |
 
@@ -151,6 +151,7 @@ Codex2API 采用三层配置架构：
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `TestModel` | string | "gpt-5.5" | 测试连接使用的模型 |
+| `TestContent` | string | "hi" | 测试连接发送给上游的用户输入内容。多行时每次随机抽取一行；支持 `{{time}}`、`{{date}}`、`{{datetime}}`、`{{timestamp}}`、`{{rand}}`、`{{rand:min-max}}` 变量 |
 | `TestConcurrency` | int | 50 | 批量测试并发数，范围 1-200 |
 
 ### 代理配置

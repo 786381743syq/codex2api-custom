@@ -37,10 +37,12 @@ import type {
   PromptFilterTestResponse,
   PublicAPIKeyUsageResponse,
   RecycleBinAccountsResponse,
+  ResetCreditsDetailResponse,
   RuntimeStatusResponse,
-  ResetRadarResponse,
   SiteBranding,
   StatsResponse,
+  SystemUpdateInfo,
+  SystemUpdateResult,
   SetupHintsResponse,
   SubmitContributionContactResponse,
   PublicContributionStatusResponse,
@@ -335,6 +337,8 @@ export const api = {
     request<MessageResponse>(`/accounts/${id}/reset-status`, { method: 'POST' }),
   resetCredits: (id: number) =>
     request<{ message: string; rate_limit_reset_credits?: number }>(`/accounts/${id}/reset-credits`, { method: 'POST' }),
+  getResetCredits: (id: number) =>
+    request<ResetCreditsDetailResponse>(`/accounts/${id}/reset-credits`),
   getAccountHealthBars: () =>
     request<AccountHealthBarsResponse>('/accounts/health-bars'),
   sendInvite: (id: number, data: { emails?: string[]; emails_text?: string; referral_key?: string; proxy_url?: string; max_emails?: number }) =>
@@ -352,7 +356,9 @@ export const api = {
   getHealth: () => request<HealthResponse>('/health'),
   getOpsOverview: () => request<OpsOverviewResponse>('/ops/overview'),
   getRuntimeStatus: () => request<RuntimeStatusResponse>('/runtime-status'),
-  getResetRadar: () => request<ResetRadarResponse>('/reset-radar'),
+  getSystemUpdate: () => request<SystemUpdateInfo>('/system/update'),
+  performSystemUpdate: () =>
+    request<SystemUpdateResult>('/system/update', { method: 'POST' }),
   getOpsErrorSummary: (params: {
     start: string
     end: string

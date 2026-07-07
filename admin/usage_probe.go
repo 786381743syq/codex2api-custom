@@ -79,7 +79,14 @@ func (h *Handler) probeUsageViaWham(ctx context.Context, account *auth.Account, 
 
 	state := proxy.ApplyWhamUsage(h.store, account, usage)
 	if limited {
-		// 限流/冷却状态：只刷新数据，不动账号健康状态与冷却。
+		// 限流/冷却态下，用 wham 返回的权威用量窗口重新判定：
+		// 若上游已重置窗口、不再限流（例如官方提前重置了 5h/7d 用量），
+		// 则主动解除限流冷却，无需等待冷却到期或用户手动测试连接。
+		// 仍不调用 ReportRequestSuccess，避免把一次零成本额度查询计入健康成功样本。
+		if !applyUsageLimitedAccountState(h.store, account, state) {
+			h.store.ClearCooldown(account)
+			log.Printf("[账号 %d] wham 显示限流窗口已重置，自动解除限流冷却", account.DBID)
+		}
 		return nil
 	}
 	h.store.ReportRequestSuccess(account, 0)
@@ -93,7 +100,7 @@ func (h *Handler) probeUsageViaWham(ctx context.Context, account *auth.Account, 
 // probeUsageViaResponses 原有探针：发送最小 /responses 请求，
 // 通过响应头同步 Codex 用量状态。会真实消耗少量 token。
 func (h *Handler) probeUsageViaResponses(ctx context.Context, account *auth.Account) error {
-	payload := buildTestPayload(h.store.GetTestModel())
+	payload := buildConnectionTestPayload(h.store, h.store.GetTestModel())
 	resp, err := proxy.ExecuteRequest(ctx, account, payload, "", h.store.ResolveProxyForAccount(account), "", nil, nil)
 	if err != nil {
 		return err

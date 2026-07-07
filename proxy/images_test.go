@@ -222,24 +222,88 @@ func TestResponsesBodyRequestsImageGenerationDetectsExplicitIntent(t *testing.T)
 	}
 }
 
-func TestExplicitlyRequestsImageGeneration(t *testing.T) {
+func TestResponsesBodyHasNaturalImageGenerationIntent(t *testing.T) {
 	cases := []struct {
 		name string
 		body []byte
 		want bool
 	}{
-		{"explicit_tools_array", []byte(`{"model":"gpt-5.5","tools":[{"type":"image_generation"}]}`), true},
-		{"object_tool_choice", []byte(`{"model":"gpt-5.5","tool_choice":{"type":"image_generation"}}`), true},
-		{"string_tool_choice", []byte(`{"model":"gpt-5.5","tool_choice":"image_generation"}`), true},
-		{"image_model", []byte(`{"model":"gpt-image-2","prompt":"draw a cat"}`), true},
-		{"top_level_option", []byte(`{"model":"gpt-5.5","input":"hi","size":"1024x1024"}`), true},
-		{"plain_request", []byte(`{"model":"gpt-5.5","input":"hello"}`), false},
-		{"function_tool_only", []byte(`{"model":"gpt-5.5","tools":[{"type":"function","name":"lookup"}]}`), false},
+		{
+			name: "chinese_direct_generation",
+			body: []byte(`{"model":"gpt-5.5","input":"帮我生成一张赛博朋克风格的猫图片"}`),
+			want: true,
+		},
+		{
+			name: "prompt_compat_generation",
+			body: []byte(`{"model":"gpt-5.5","prompt":"画一张水彩风的山景"}`),
+			want: true,
+		},
+		{
+			name: "meme_generation_not_table",
+			body: []byte(`{"model":"gpt-5.5","input":"生成一张表情包"}`),
+			want: true,
+		},
+		{
+			name: "image_edit_text_part",
+			body: []byte(`{"model":"gpt-5.5","input":[{"role":"user","content":[{"type":"input_text","text":"edit this image to make the background blue"}]}]}`),
+			want: true,
+		},
+		{
+			name: "plain_chat",
+			body: []byte(`{"model":"gpt-5.5","input":"hello, explain this error"}`),
+			want: false,
+		},
+		{
+			name: "script_request",
+			body: []byte(`{"model":"gpt-5.5","input":"帮我写一个生成图片的 Python 脚本"}`),
+			want: false,
+		},
+		{
+			name: "api_question",
+			body: []byte(`{"model":"gpt-5.5","input":"介绍一下 image generation API 怎么调用"}`),
+			want: false,
+		},
+		{
+			name: "table_request",
+			body: []byte(`{"model":"gpt-5.5","input":"生成一张表格对比这些方案"}`),
+			want: false,
+		},
+		{
+			name: "diagram_code_request",
+			body: []byte(`{"model":"gpt-5.5","input":"生成一张架构图的 Mermaid 代码"}`),
+			want: false,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := explicitlyRequestsImageGeneration(tc.body); got != tc.want {
-				t.Fatalf("explicitlyRequestsImageGeneration(%s) = %v, want %v", tc.body, got, tc.want)
+			if got := responsesBodyHasNaturalImageGenerationIntent(tc.body); got != tc.want {
+				t.Fatalf("responsesBodyHasNaturalImageGenerationIntent() = %v, want %v for %s", got, tc.want, tc.body)
+			}
+		})
+	}
+}
+
+func TestRawResponsesBodyShouldForceHTTPForImageGeneration(t *testing.T) {
+	cases := []struct {
+		name string
+		body []byte
+		want bool
+	}{
+		{"explicit_tool_choice", []byte(`{"model":"gpt-5.5","tool_choice":{"type":"image_generation"}}`), true},
+		{"natural_language_generation", []byte(`{"model":"gpt-5.5","input":"生成一张未来城市海报"}`), true},
+		{"image_only_model", []byte(`{"model":"gpt-image-2","prompt":"draw a cat"}`), true},
+		{"top_level_option", []byte(`{"model":"gpt-5.5","input":"hi","size":"1024x1024"}`), true},
+		{"plain_request", []byte(`{"model":"gpt-5.5","input":"hello"}`), false},
+		{"image_generation_code_request", []byte(`{"model":"gpt-5.5","input":"帮我写一个生成图片的 Python 脚本"}`), false},
+		// issue #304: 注入的 image_generation 工具但无 tool_choice / 无自然语言意图，
+		// 不应因工具单纯存在而强制 HTTP，普通请求继续走 WS。
+		{"injected_tool_without_intent", []byte(`{"model":"gpt-5.5","input":"hello","tools":[{"type":"image_generation"}]}`), false},
+		{"injected_tool_plain_chat", []byte(`{"model":"gpt-5.5","input":"解释一下这段报错","tools":[{"type":"image_generation","model":"gpt-image-2"},{"type":"function","name":"lookup"}]}`), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := rawResponsesBodyShouldForceHTTPForImageGeneration(tc.body); got != tc.want {
+				t.Fatalf("rawResponsesBodyShouldForceHTTPForImageGeneration() = %v, want %v for %s", got, tc.want, tc.body)
 			}
 		})
 	}
@@ -301,7 +365,7 @@ func TestTranslateRequestDoesNotFlagPlainChatAsImageGeneration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("TranslateRequest: %v", err)
 	}
-	if explicitlyRequestsImageGeneration(codexBody) {
+	if rawResponsesBodyShouldForceHTTPForImageGeneration(codexBody) {
 		t.Fatalf("plain chat request should not be flagged as image generation: %s", codexBody)
 	}
 }

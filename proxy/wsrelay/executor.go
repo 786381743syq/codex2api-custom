@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -32,11 +31,49 @@ const (
 
 func shouldSendWebsocketUserAgent() bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("CODEX_WS_SEND_USER_AGENT"))) {
+	case "0", "false", "no", "n", "off":
+		return false
+	default:
+		return true
+	}
+}
+
+// statelessOneShotEnabled 是否禁用无显式会话请求的 WS 连接复用（每请求独享连接、
+// 用完即毁）。这是杜绝一切连接级状态跨请求/跨用户泄漏的硬隔离逃生阀，代价是
+// 逐请求握手（高 RPM 下可能触发上游握手限流 503）。
+func statelessOneShotEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("CODEX_WS_STATELESS_ONESHOT"))) {
 	case "1", "true", "yes", "y", "on":
 		return true
 	default:
 		return false
 	}
+}
+
+// resolveHandshakeSessionID 决定 WS 握手头 Session_id/Conversation_id 的取值。
+// 该头是逐连接冻结的：建连时发送一次，连接复用时永不更新。因此对会在多个请求
+// （乃至共享同一 API Key 的多个终端用户）间复用的 stateless 连接，绝不能携带任何
+// "单个请求的身份"（如每请求随机 prompt_cache_key）——若上游按连接级
+// Conversation_id 绑定会话状态，第一个请求的对话身份会泄漏给后续复用该连接的
+// 所有用户，造成跨用户上下文污染（issue #268/#308 同类，"用户2串到用户1的上下文"）。
+//
+//   - 显式会话（非 stateless）：连接按会话专用，头 = 会话 ID（原行为）。
+//   - stateless + 默认隔离（poolRouteKey 非空）：返回空串 → 不发送该组头，
+//     上游没有任何可绑定的连接级会话身份；逐请求身份完全由帧体内每请求唯一的
+//     prompt_cache_key 承担。
+//   - stateless + per-api-key 模式（poolRouteKey 为空）：沿用帧体的确定性
+//     cache key（该模式显式选择按 Key 共享上游缓存，头与帧体一致才有缓存收益）。
+func resolveHandshakeSessionID(sessionID, poolRouteKey string, wsBody []byte) string {
+	if !proxy.IsStatelessWebsocketSessionID(sessionID) {
+		return sessionID
+	}
+	if strings.TrimSpace(poolRouteKey) != "" {
+		return ""
+	}
+	if cacheKey := strings.TrimSpace(gjson.GetBytes(wsBody, "prompt_cache_key").String()); cacheKey != "" {
+		return cacheKey
+	}
+	return sessionID
 }
 
 // ==================== WebSocket 执行器 ====================
@@ -89,15 +126,7 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	// 准备请求体
 	wsBody := e.prepareWebsocketBody(requestBody, sessionID)
 
-	// 握手头中的 Session_id/Conversation_id 会影响上游 prompt cache 路由，必须与
-	// 请求体的确定性 prompt_cache_key 一致；stateless 连接 ID 是每请求随机的，
-	// 发给上游会导致 prompt cache 永远 miss，它只用于本地连接池隔离。
-	headerSessionID := sessionID
-	if proxy.IsStatelessWebsocketSessionID(sessionID) {
-		if cacheKey := strings.TrimSpace(gjson.GetBytes(wsBody, "prompt_cache_key").String()); cacheKey != "" {
-			headerSessionID = cacheKey
-		}
-	}
+	headerSessionID := resolveHandshakeSessionID(sessionID, poolRouteKey, wsBody)
 
 	// 构建 WebSocket URL
 	httpURL := proxy.CodexBaseURL + CodexWsEndpoint
@@ -112,7 +141,7 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	}
 
 	// 准备请求头
-	headers := e.prepareWebsocketHeaders(accessToken, accountIDStr, headerSessionID, apiKey, deviceCfg, ginHeaders)
+	headers := e.prepareWebsocketHeaders(accessToken, account, accountIDStr, headerSessionID, apiKey, deviceCfg, ginHeaders)
 
 	// Resin 反代：注入账号身份头
 	if proxy.IsResinEnabled() {
@@ -123,37 +152,51 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	// 的槽位池内复用连接，避免持续高 RPM 下逐请求握手触发上游限流。
 	//
 	// 连接池 baseKey 必须按 API Key 稳定，绝不能等于每请求唯一的上游身份键，否则
-	// 默认隔离模式下 headerSessionID 每请求都变 → 槽位池失效 → 逐请求握手触发 503。
+	// 默认隔离模式下每请求都变 → 槽位池失效 → 逐请求握手触发 503。
 	// poolRouteKey（来自上游确定性键）非空时优先用它作 baseKey：连接复用按 API Key
 	// 稳定命中同一组 8 槽。
 	//
 	// 隔离说明：默认隔离模式下，每请求的上游身份隔离由写入每个 response.create 帧体的
 	// 每请求唯一 prompt_cache_key 保证（见 proxy/executor.go 注入处）。握手头里的
-	// Session_id/Conversation_id 只在建连时发送一次、对一条复用连接的生命周期保持不变
-	// （复用连接上不是逐请求轮换），因此不能依赖它做逐请求隔离。
+	// Session_id/Conversation_id 是逐连接冻结的，绝不能携带任何单个请求的身份
+	// （见 resolveHandshakeSessionID）。
+	//
+	// CODEX_WS_STATELESS_ONESHOT=1 时禁用槽位复用：每个无会话请求独享一条连接、
+	// 用完即毁（彻底杜绝任何连接级状态跨请求泄漏，代价是逐请求握手）。
+	// 续链亲和：上游无服务端存储时，previous_response_id 的上下文只存活在产出
+	// 该响应的那条 WS 连接里。带续链 ID 的请求优先取回原连接（独占成功才用），
+	// 否则落到随机槽位会触发上游 "previous response not found"。
 	poolSessionID := sessionID
-	effectiveProxy := effectiveProxyURL(account, proxyOverride)
 	var wc *WsConnection
 	var pr *PendingRequest
 	var err2 error
-	if proxy.IsStatelessWebsocketSessionID(sessionID) && headerSessionID != sessionID {
-		baseKey := headerSessionID
-		if strings.TrimSpace(poolRouteKey) != "" {
-			baseKey = poolRouteKey
+	if prevRespID := strings.TrimSpace(gjson.GetBytes(wsBody, "previous_response_id").String()); prevRespID != "" {
+		if pwc, ppr, slotKey := e.manager.AcquirePreferredConnection(prevRespID, account.ID(), apiKey); pwc != nil {
+			wc, pr, poolSessionID = pwc, ppr, slotKey
 		}
-		wc, pr, poolSessionID, err2 = e.manager.AcquireReusableConnection(ctx, account, wsURL, baseKey, sessionID, StatelessConnectionSlots, headers, proxyOverride)
-	} else {
-		wc, pr, err2 = e.manager.AcquireConnection(ctx, account, wsURL, sessionID, headers, proxyOverride)
+	}
+	baseKey := strings.TrimSpace(poolRouteKey)
+	if baseKey == "" && headerSessionID != sessionID {
+		baseKey = headerSessionID
+	}
+	if wc == nil {
+		if proxy.IsStatelessWebsocketSessionID(sessionID) && baseKey != "" && !statelessOneShotEnabled() {
+			wc, pr, poolSessionID, err2 = e.manager.AcquireReusableConnection(ctx, account, wsURL, baseKey, sessionID, StatelessConnectionSlots, headers, proxyOverride)
+		} else {
+			wc, pr, err2 = e.manager.AcquireConnection(ctx, account, wsURL, sessionID, headers, proxyOverride)
+		}
 	}
 	if err2 != nil {
 		return nil, err2
 	}
 
-	// 发送请求，失败时最多重试 2 次（重建连接）
+	// 发送请求，失败时最多重试 2 次（重建连接）。
+	// 用 DiscardConnection 按连接指针精确清理：续链亲和取回的连接其 PoolKey
+	// 可能与当前请求的 proxy 组合不同，按参数重算 key 会漏删。
 	sendErr := e.sendRequest(wc, wsBody, pr.RequestID)
 	for retries := 0; sendErr != nil && retries < 2; retries++ {
 		wc.session.RemovePendingRequest(pr.RequestID)
-		e.manager.RemoveConnection(account.ID(), wsURL, poolSessionID, effectiveProxy)
+		e.manager.DiscardConnection(wc)
 
 		// 短暂退避，避免瞬间重连风暴
 		select {
@@ -170,7 +213,7 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	}
 	if sendErr != nil {
 		wc.session.RemovePendingRequest(pr.RequestID)
-		e.manager.RemoveConnection(account.ID(), wsURL, poolSessionID, effectiveProxy)
+		e.manager.DiscardConnection(wc)
 		return nil, fmt.Errorf("发送 WebSocket 请求失败: %w", sendErr)
 	}
 
@@ -182,6 +225,7 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 		pendingReq:  pr,
 		sessionID:   poolSessionID,
 		manager:     e.manager,
+		apiKey:      apiKey,
 		readErrChan: make(chan error, 1),
 	}, nil
 }
@@ -224,7 +268,7 @@ func (e *Executor) prepareWebsocketBody(body []byte, sessionID string) []byte {
 }
 
 // prepareWebsocketHeaders 准备 WebSocket 请求头
-func (e *Executor) prepareWebsocketHeaders(accessToken, accountID, sessionID, apiKey string, deviceCfg *proxy.DeviceProfileConfig, ginHeaders http.Header) http.Header {
+func (e *Executor) prepareWebsocketHeaders(accessToken string, account *auth.Account, accountID, sessionID, apiKey string, deviceCfg *proxy.DeviceProfileConfig, ginHeaders http.Header) http.Header {
 	headers := http.Header{}
 
 	// 认证头
@@ -233,28 +277,16 @@ func (e *Executor) prepareWebsocketHeaders(accessToken, accountID, sessionID, ap
 	// Beta header 启用 WebSocket 响应 API
 	headers.Set("OpenAI-Beta", responsesWebsocketBetaHeader)
 
+	usedGeneratedHeaders := false
 	if shouldSendWebsocketUserAgent() {
-		account := &auth.Account{}
-		if accountID != "" {
-			account.AccountID = accountID
-			if id, err := strconv.ParseInt(accountID, 10, 64); err == nil {
-				account.DBID = id
-			}
+		if account == nil {
+			account = &auth.Account{AccountID: accountID}
 		}
-		if proxy.IsDeviceProfileStabilizationEnabled(deviceCfg) {
-			profile := proxy.ResolveDeviceProfile(account, apiKey, ginHeaders, deviceCfg)
-			headers.Set("User-Agent", profile.UserAgent)
-			if version := strings.TrimSpace(profile.PackageVersion); version != "" {
-				headers.Set("Version", version)
-			}
-		} else if userAgent := strings.TrimSpace(ginHeaders.Get("User-Agent")); proxy.IsCodexOfficialClientByHeaders(userAgent, ginHeaders.Get("Originator")) && userAgent != "" {
-			headers.Set("User-Agent", userAgent)
-			if version := strings.TrimSpace(ginHeaders.Get("Version")); version != "" {
-				headers.Set("Version", version)
-			}
-		} else {
-			headers.Set("User-Agent", proxy.MinimalCodexCLIUserAgentForHeaders())
-			headers.Set("Version", proxy.LatestCodexCLIVersionForHeaders())
+		var userAgent, version string
+		userAgent, version, usedGeneratedHeaders = proxy.ResolveCodexOutboundClientHeadersWithDecision(account, apiKey, deviceCfg, ginHeaders)
+		headers.Set("User-Agent", userAgent)
+		if version != "" {
+			headers.Set("Version", version)
 		}
 	}
 	if betaFeatures := strings.TrimSpace(ginHeaders.Get("X-Codex-Beta-Features")); betaFeatures != "" {
@@ -264,7 +296,7 @@ func (e *Executor) prepareWebsocketHeaders(accessToken, accountID, sessionID, ap
 	}
 
 	// Originator
-	if originator := strings.TrimSpace(ginHeaders.Get("Originator")); originator != "" && proxy.IsCodexOfficialClientByHeaders("", originator) {
+	if originator := strings.TrimSpace(ginHeaders.Get("Originator")); !usedGeneratedHeaders && originator != "" && proxy.IsCodexOfficialClientByHeaders("", originator) {
 		headers.Set("Originator", originator)
 	} else {
 		headers.Set("Originator", proxy.Originator)
@@ -282,6 +314,13 @@ func (e *Executor) prepareWebsocketHeaders(accessToken, accountID, sessionID, ap
 	if sessionID = strings.TrimSpace(sessionID); sessionID != "" {
 		headers.Set("Session_id", sessionID)
 		headers.Set("Conversation_id", sessionID)
+	}
+	for name, value := range account.GetCustomHeaders() {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		headers.Set(name, value)
 	}
 
 	return headers
@@ -305,10 +344,18 @@ type WsResponse struct {
 	manager     *Manager
 	readErrChan chan error
 	closed      bool
-	// connBroken 标记读流因上游 WS 异常(非正常关闭)而终止；Close() 据此销毁坏连接
-	// 而非归还连接池复用。受 mu 保护。
+	// apiKey 发起本请求的下游 API Key，用于 response_id → 连接绑定的归属校验。
+	apiKey string
+	// connBroken 标记读流因上游 WS 异常(非正常关闭)或下游写入失败而终止；
+	// Close() 据此销毁坏连接而非归还连接池复用。受 mu 保护。
 	connBroken bool
-	mu         sync.Mutex
+	// streamCompleted 标记读流已消费到明确的终止边界(response.completed /
+	// response.failed / 上游 error 帧)。Close() 只在此标记为 true 且未标记
+	// connBroken 时才归还连接复用；其余情况(下游断开、ctx 取消、上游关闭、
+	// 握手失败后未读流等)上游可能仍在该连接上推送残留帧，归还复用会把上一个
+	// 请求的响应串给下一个用户(issue #308)，必须销毁。受 mu 保护。
+	streamCompleted bool
+	mu              sync.Mutex
 }
 
 // ReadStream 读取 SSE 流
@@ -347,6 +394,9 @@ func (r *WsResponse) ReadStream(callback func(data []byte) bool) error {
 		// 解析并处理消息
 		if err := r.handleMessage(payload, callback); err != nil {
 			if err == io.EOF {
+				// 到达终止边界(完成/失败/错误帧)。若中途下游写入失败已标记
+				// connBroken，Close() 仍会销毁连接。
+				r.markStreamCompleted()
 				return nil
 			}
 			return err
@@ -370,12 +420,27 @@ func (r *WsResponse) handleMessage(payload []byte, callback func(data []byte) bo
 
 	// 调用回调
 	if !callback(payload) {
+		// 下游写入失败(broken pipe / 客户端断开)：响应流在非终止边界被截断，
+		// 上游仍会在这条连接上继续推送本响应的剩余帧。连接必须销毁，
+		// 归还池中复用会把残留帧串给下一个请求(issue #308)。
+		r.markConnBroken()
 		return io.EOF
 	}
 
 	// 检查是否是终止事件
 	eventType := gjson.GetBytes(payload, "type").String()
 	if eventType == "response.completed" || eventType == "response.failed" {
+		// 续链亲和：记录本响应由哪条连接产出，后续带 previous_response_id 的
+		// 请求可回到原连接（上游无服务端存储时上下文只存活在连接内）。
+		if eventType == "response.completed" && r.manager != nil && r.conn != nil {
+			if respID := gjson.GetBytes(payload, "response.id").String(); respID != "" {
+				accountID := int64(0)
+				if r.conn.session != nil {
+					accountID = r.conn.session.AccountID
+				}
+				r.manager.BindResponseConn(respID, r.conn, r.sessionID, accountID, r.apiKey)
+			}
+		}
 		return io.EOF
 	}
 
@@ -432,10 +497,17 @@ func normalizeCompletionEvent(payload []byte) []byte {
 	return payload
 }
 
-// markConnBroken 标记底层连接因上游 WS 异常而不可复用（幂等，受 mu 保护）。
+// markConnBroken 标记底层连接因上游 WS 异常或下游写入失败而不可复用（幂等，受 mu 保护）。
 func (r *WsResponse) markConnBroken() {
 	r.mu.Lock()
 	r.connBroken = true
+	r.mu.Unlock()
+}
+
+// markStreamCompleted 标记读流已消费到明确的终止边界（幂等，受 mu 保护）。
+func (r *WsResponse) markStreamCompleted() {
+	r.mu.Lock()
+	r.streamCompleted = true
 	r.mu.Unlock()
 }
 
@@ -455,15 +527,17 @@ func (r *WsResponse) Close() error {
 		r.conn.session.RemovePendingRequest(r.pendingReq.RequestID)
 	}
 
-	// 根据读流是否异常终止决定连接去向：
-	//   - 正常完成：归还连接池继续复用。
-	//   - 上游 WS 异常(close 1006/1009/1011、broken pipe 等)：销毁坏连接并移出连接池，
-	//     否则坏连接会被误判为可复用，导致后续请求首字变慢/断流，且底层 fd 滞留 CLOSE_WAIT。
+	// 根据读流的结束方式决定连接去向：
+	//   - 读到终止边界(completed/failed/error 帧)且无异常：归还连接池继续复用。
+	//   - 其余任何情况一律销毁并移出连接池：
+	//     * 上游 WS 异常(close 1006/1009/1011、read error) → 坏连接复用会断流且 fd 滞留 CLOSE_WAIT；
+	//     * 下游写入失败 / ctx 取消 / 上游正常关闭 / 握手失败后未读流 → 流没消费到边界，
+	//       上游可能仍在推送残留帧，复用会串会话(issue #308)。
 	if r.conn != nil {
-		if r.connBroken {
-			r.manager.DiscardConnection(r.conn)
-		} else {
+		if !r.connBroken && r.streamCompleted {
 			r.manager.ReleaseConnection(r.conn)
+		} else {
+			r.manager.DiscardConnection(r.conn)
 		}
 	}
 
@@ -569,8 +643,10 @@ func websocketResponseToHTTP(ctx context.Context, wsResp *WsResponse, statusCode
 	go func() {
 		select {
 		case <-ctx.Done():
-			_ = wsResp.Close()
+			// 先关 pipe 再关 WS 响应：pipe 以第一个错误为准，保证下游读到的是
+			// cancellation 而不是随后销毁连接引发的 read error。
 			_ = pw.CloseWithError(ctx.Err())
+			_ = wsResp.Close()
 		case <-done:
 		}
 	}()

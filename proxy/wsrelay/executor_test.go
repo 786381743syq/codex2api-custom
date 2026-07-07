@@ -37,7 +37,7 @@ func TestPrepareWebsocketHeadersUsesConfiguredDefaultsAndBetaFeatures(t *testing
 		"Originator": []string{"custom-originator"},
 	}
 
-	headers := exec.prepareWebsocketHeaders("token-123", "42", "session-123", "api-key-1", cfg, ginHeaders)
+	headers := exec.prepareWebsocketHeaders("token-123", &auth.Account{DBID: 42, AccountID: "42"}, "42", "session-123", "api-key-1", cfg, ginHeaders)
 
 	if got := headers.Get("Authorization"); got != "Bearer token-123" {
 		t.Fatalf("Authorization = %q", got)
@@ -68,7 +68,33 @@ func TestPrepareWebsocketHeadersUsesConfiguredDefaultsAndBetaFeatures(t *testing
 	}
 }
 
-func TestPrepareWebsocketHeadersOmitsUserAgentByDefault(t *testing.T) {
+func TestPrepareWebsocketHeadersAppliesAccountCustomHeadersLast(t *testing.T) {
+	exec := NewExecutor()
+	account := &auth.Account{
+		DBID:      42,
+		AccountID: "42",
+		CustomHeaders: map[string]string{
+			"Authorization":      "Bearer websocket-override",
+			"Chatgpt-Account-Id": "acct-override",
+			"X-Custom-Header":    "custom-value",
+		},
+	}
+
+	headers := exec.prepareWebsocketHeaders("token-123", account, "42", "session-123", "api-key-1", nil, http.Header{})
+
+	if got := headers.Get("Authorization"); got != "Bearer websocket-override" {
+		t.Fatalf("Authorization = %q", got)
+	}
+	if got := headers.Get("Chatgpt-Account-Id"); got != "acct-override" {
+		t.Fatalf("Chatgpt-Account-Id = %q", got)
+	}
+	if got := headers.Get("X-Custom-Header"); got != "custom-value" {
+		t.Fatalf("X-Custom-Header = %q", got)
+	}
+}
+
+func TestPrepareWebsocketHeadersSendsUserAgentByDefault(t *testing.T) {
+	t.Setenv("CODEX_WS_SEND_USER_AGENT", "")
 	exec := NewExecutor()
 	ginHeaders := http.Header{
 		"X-Codex-Turn-State":                    []string{"turn-state"},
@@ -77,13 +103,13 @@ func TestPrepareWebsocketHeadersOmitsUserAgentByDefault(t *testing.T) {
 		"X-Responsesapi-Include-Timing-Metrics": []string{"true"},
 	}
 
-	headers := exec.prepareWebsocketHeaders("token-123", "42", "session-123", "api-key-1", nil, ginHeaders)
+	headers := exec.prepareWebsocketHeaders("token-123", &auth.Account{DBID: 42, AccountID: "42"}, "42", "session-123", "api-key-1", nil, ginHeaders)
 
-	if got := headers.Get("User-Agent"); got != "" {
-		t.Fatalf("User-Agent = %q, want empty", got)
+	if got := headers.Get("User-Agent"); got != proxy.MinimalCodexCLIUserAgentForHeaders() {
+		t.Fatalf("User-Agent = %q, want %q", got, proxy.MinimalCodexCLIUserAgentForHeaders())
 	}
-	if got := headers.Get("Version"); got != "" {
-		t.Fatalf("Version = %q, want empty", got)
+	if got := headers.Get("Version"); got != proxy.LatestCodexCLIVersionForHeaders() {
+		t.Fatalf("Version = %q, want %q", got, proxy.LatestCodexCLIVersionForHeaders())
 	}
 	if got := headers.Get("OpenAI-Beta"); got != responsesWebsocketBetaHeader {
 		t.Fatalf("OpenAI-Beta = %q", got)
@@ -98,6 +124,53 @@ func TestPrepareWebsocketHeadersOmitsUserAgentByDefault(t *testing.T) {
 	}
 	if got := headers.Get("Conversation_id"); got != "session-123" {
 		t.Fatalf("Conversation_id = %q", got)
+	}
+}
+
+func TestPrepareWebsocketHeadersCanOptOutOfUserAgent(t *testing.T) {
+	t.Setenv("CODEX_WS_SEND_USER_AGENT", "false")
+	exec := NewExecutor()
+
+	headers := exec.prepareWebsocketHeaders("token-123", &auth.Account{DBID: 42, AccountID: "42"}, "42", "session-123", "api-key-1", nil, http.Header{})
+
+	if got := headers.Get("User-Agent"); got != "" {
+		t.Fatalf("User-Agent = %q, want empty", got)
+	}
+	if got := headers.Get("Version"); got != "" {
+		t.Fatalf("Version = %q, want empty", got)
+	}
+}
+
+func TestPrepareWebsocketHeadersHonorsForcedGeneratedUserAgent(t *testing.T) {
+	t.Setenv("CODEX_WS_SEND_USER_AGENT", "true")
+	prev := proxy.CurrentRuntimeSettings()
+	proxy.ApplyRuntimeSettings(proxy.RuntimeSettings{ClientCompatMode: proxy.ClientCompatModeForce})
+	t.Cleanup(func() { proxy.ApplyRuntimeSettings(prev) })
+	exec := NewExecutor()
+	account := &auth.Account{DBID: 43, AccountID: "42"}
+	ginHeaders := http.Header{
+		"User-Agent": []string{"codex_vscode/1.2.3"},
+		"Originator": []string{"codex_vscode"},
+		"Version":    []string{"1.2.3"},
+	}
+
+	headers := exec.prepareWebsocketHeaders("token-123", account, "42", "session-123", "api-key-1", nil, ginHeaders)
+
+	got := headers.Get("User-Agent")
+	if got == ginHeaders.Get("User-Agent") {
+		t.Fatalf("User-Agent preserved client UA %q in forced mode", got)
+	}
+	if got != proxy.ProfileForAccount(account.DBID).UserAgent {
+		t.Fatalf("User-Agent = %q, want real account profile %q", got, proxy.ProfileForAccount(account.DBID).UserAgent)
+	}
+	if !strings.HasPrefix(got, "codex-tui/") || !strings.Contains(got, " (") {
+		t.Fatalf("User-Agent = %q, want generated full codex-tui profile", got)
+	}
+	if version := headers.Get("Version"); version != proxy.LatestCodexCLIVersionForHeaders() {
+		t.Fatalf("Version = %q, want %q", version, proxy.LatestCodexCLIVersionForHeaders())
+	}
+	if originator := headers.Get("Originator"); originator != proxy.Originator {
+		t.Fatalf("Originator = %q, want %q", originator, proxy.Originator)
 	}
 }
 
@@ -350,5 +423,67 @@ func TestSendRequestWritesResponseCreatePayloadDirectly(t *testing.T) {
 	}
 	if gjson.GetBytes(got, "request_id").Exists() {
 		t.Fatalf("payload should not contain internal request_id wrapper: %s", got)
+	}
+}
+
+// TestResolveHandshakeSessionID 验证握手头 Session_id/Conversation_id 的取值策略。
+// 该头逐连接冻结、复用连接时永不更新，因此 stateless 复用连接绝不能携带任何
+// 单个请求的身份，否则第一个请求的会话身份会泄漏给后续复用该连接的所有用户
+// （跨用户上下文污染，"用户2串到用户1的上下文"）。
+func TestResolveHandshakeSessionID(t *testing.T) {
+	t.Run("explicit session keeps original behavior", func(t *testing.T) {
+		got := resolveHandshakeSessionID("session-123", "route-key", []byte(`{"prompt_cache_key":"whatever"}`))
+		if got != "session-123" {
+			t.Fatalf("headerSessionID = %q, want session-123", got)
+		}
+	})
+
+	t.Run("stateless isolated mode must not send any session identity", func(t *testing.T) {
+		// 默认隔离模式：帧体是每请求随机 prompt_cache_key，poolRouteKey 非空。
+		// 若把随机 key 冻结进握手头，复用连接的后续用户都会顶着第一个请求的身份。
+		got := resolveHandshakeSessionID("stateless-abc", "route-key", []byte(`{"prompt_cache_key":"per-request-random-uuid"}`))
+		if got != "" {
+			t.Fatalf("headerSessionID = %q, want empty (no connection-level session identity)", got)
+		}
+	})
+
+	t.Run("stateless per-api-key mode keeps deterministic cache key", func(t *testing.T) {
+		got := resolveHandshakeSessionID("stateless-abc", "", []byte(`{"prompt_cache_key":"deterministic-key"}`))
+		if got != "deterministic-key" {
+			t.Fatalf("headerSessionID = %q, want deterministic-key", got)
+		}
+	})
+
+	t.Run("stateless without cache key falls back to stateless id", func(t *testing.T) {
+		got := resolveHandshakeSessionID("stateless-abc", "", []byte(`{}`))
+		if got != "stateless-abc" {
+			t.Fatalf("headerSessionID = %q, want stateless-abc", got)
+		}
+	})
+}
+
+// TestPrepareWebsocketHeadersOmitsSessionHeadersWhenEmpty 验证 headerSessionID 为空时
+// 不发送 Session_id/Conversation_id 握手头（隔离模式的 stateless 复用连接）。
+func TestPrepareWebsocketHeadersOmitsSessionHeadersWhenEmpty(t *testing.T) {
+	exec := NewExecutor()
+
+	headers := exec.prepareWebsocketHeaders("token-123", &auth.Account{DBID: 42, AccountID: "42"}, "42", "", "api-key-1", nil, http.Header{})
+
+	if got := headers.Get("Session_id"); got != "" {
+		t.Fatalf("Session_id = %q, want unset", got)
+	}
+	if got := headers.Get("Conversation_id"); got != "" {
+		t.Fatalf("Conversation_id = %q, want unset", got)
+	}
+}
+
+func TestStatelessOneShotEnabled(t *testing.T) {
+	t.Setenv("CODEX_WS_STATELESS_ONESHOT", "")
+	if statelessOneShotEnabled() {
+		t.Fatal("default must be false (slot reuse on)")
+	}
+	t.Setenv("CODEX_WS_STATELESS_ONESHOT", "1")
+	if !statelessOneShotEnabled() {
+		t.Fatal("CODEX_WS_STATELESS_ONESHOT=1 must disable slot reuse")
 	}
 }

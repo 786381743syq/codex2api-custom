@@ -69,6 +69,26 @@
 
 ---
 
+## 赞助商
+
+> 想出现在这里？请到 GitHub 提交 Issue 联系。
+
+<table>
+<tr>
+<td width="180" align="center" valign="middle"><a href="https://aihub.top/register?aff=42WZVXN9KS4S"><img src="assets/aihub-logo.jpg" width="160" alt="AIHub"></a></td>
+<td valign="middle"><b><a href="https://aihub.top/register?aff=42WZVXN9KS4S">AIHub</a></b> 是一家面向个人开发者和企业团队的高可用 AI 模型 API 中转平台。支持 Codex/Claude Code，价格大约是官方的 1 折不到！通过链接注册，使用优惠码 <code>CODEX2API</code> 即可获得 3$ 测试额度。</td>
+</tr>
+</table>
+
+<table>
+<tr>
+<td width="180" align="center" valign="middle"><a href="https://ai.centos.hk"><b>星辰·AI</b></a></td>
+<td valign="middle"><b><a href="https://ai.centos.hk">星辰·AI</a></b> 提供稳定、高速的 Claude Code / Codex / Gemini 中转服务，面向个人开发者与团队均适用。</td>
+</tr>
+</table>
+
+---
+
 ## 目录
 
 - [在线 Demo](#在线-demo)
@@ -88,19 +108,6 @@
 - [免责声明](#免责声明与开源协议)
 - [Star History](#star-history)
 - [友情链接](#友情链接)
-
----
-
-## 赞助商
-
-> 想出现在这里？请到 GitHub 提交 Issue 联系。
-
-<table>
-<tr>
-<td width="180" align="center" valign="middle"><a href="https://ai.centos.hk"><b>星辰·AI</b></a></td>
-<td valign="middle">感谢 <b><a href="https://ai.centos.hk">星辰·AI</a></b> 赞助了本项目！星辰·AI 提供稳定、高速的 Claude Code / Codex / Gemini 中转服务，面向个人开发者与团队均适用。</td>
-</tr>
-</table>
 
 ---
 
@@ -316,7 +323,7 @@ Vite 会自动代理 `/api` 和 `/health` 到后端，开发时访问 `http://lo
 
 以下参数**保存在数据库 `SystemSettings` 中**，通过管理台设置页面修改：
 
-`MaxConcurrency`、`GlobalRPM`、`TestModel`、`TestConcurrency`、`ProxyURL`、`PgMaxConns`、`RedisPoolSize`、`AdminSecret`、`SchedulerMode`、自动清理开关等。
+`MaxConcurrency`、`GlobalRPM`、`TestModel`、`TestContent`、`TestConcurrency`、`ProxyURL`、`PgMaxConns`、`RedisPoolSize`、`AdminSecret`、`SchedulerMode`、自动清理开关等。
 
 首次启动时程序会自动写入默认设置。
 

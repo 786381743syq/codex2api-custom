@@ -233,14 +233,23 @@ func accountFilterForModel(model string) auth.AccountFilter {
 }
 
 func accountFilterForResponsesModel(model string, allowCodexAccounts bool) auth.AccountFilter {
-	model = strings.TrimSpace(model)
-	codexFilter := accountFilterForModel(model)
+	return accountFilterForResponsesModelWithOriginal(model, model, allowCodexAccounts)
+}
+
+func accountFilterForResponsesModelWithOriginal(originalModel string, effectiveModel string, allowCodexAccounts bool) auth.AccountFilter {
+	originalModel = strings.TrimSpace(originalModel)
+	effectiveModel = strings.TrimSpace(effectiveModel)
+	codexFilter := accountFilterForModel(effectiveModel)
 	return func(account *auth.Account) bool {
 		if account == nil {
 			return false
 		}
 		if account.IsOpenAIResponsesAPI() {
-			return account.SupportsOpenAIResponsesModel(model) && (model == "" || !account.IsModelRateLimited(model))
+			routedModel := effectiveModel
+			if mappedModel, ok := resolveAccountModelMappingForCandidates(account, originalModel, effectiveModel); ok && mappedModel != "" {
+				routedModel = mappedModel
+			}
+			return account.SupportsOpenAIResponsesModel(routedModel) && (routedModel == "" || !account.IsModelRateLimited(routedModel))
 		}
 		if !allowCodexAccounts {
 			return false
@@ -260,6 +269,44 @@ func modelIDInList(model string, models []string) bool {
 		}
 	}
 	return false
+}
+
+func (h *Handler) modelSupportedByAccountMapping(model string) bool {
+	model = strings.TrimSpace(model)
+	if model == "" || h == nil || h.store == nil {
+		return false
+	}
+	for _, account := range h.store.Accounts() {
+		if account == nil || !account.IsOpenAIResponsesAPI() {
+			continue
+		}
+		mappedModel, ok := resolveAccountModelMapping(account, model)
+		if ok && mappedModel != "" && account.SupportsOpenAIResponsesModel(mappedModel) {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *Handler) modelValidator(supportedModels []string) api.ValidationRule {
+	validModels := make(map[string]bool, len(supportedModels))
+	for _, model := range supportedModels {
+		validModels[model] = true
+	}
+	return func(value gjson.Result, path string) *api.ValidationError {
+		if !value.Exists() || value.Type != gjson.String {
+			return nil
+		}
+		model := value.String()
+		if validModels[model] || h.modelSupportedByAccountMapping(model) {
+			return nil
+		}
+		return &api.ValidationError{
+			Field:   path,
+			Message: fmt.Sprintf("Model '%s' is not supported", model),
+			Code:    "unsupported_model",
+		}
+	}
 }
 
 func effectiveRequestModel(body []byte, fallback string) string {
@@ -386,37 +433,46 @@ func NewHandlerWithDeviceProfile(store *auth.Store, db *database.DB, deviceCfg *
 	return NewHandler(store, db, nil, deviceCfg)
 }
 
-func (h *Handler) resolveAPIKey(key string) (*database.APIKeyRow, bool) {
+// resolveAPIKey 解析下游 API Key。返回值区分三种结果：
+//   - (row, true, nil)：命中有效 key
+//   - (nil, false, nil)：确认查无此 key（应答 401）
+//   - (nil, false, err)：DB/基础设施暂时性故障（应答 503，而非误报 key 无效）
+//
+// 关键：绝不能把"数据库连接耗尽/超时"这类暂时性故障当成"客户端 key 无效"
+// 返回 401，否则压测或 DB 抖动时客户端会误以为自己的凭证失效（issue #323）。
+func (h *Handler) resolveAPIKey(key string) (*database.APIKeyRow, bool, error) {
 	key = strings.TrimSpace(key)
 	if key == "" {
-		return nil, false
+		return nil, false, nil
 	}
 	if h.configKeys[key] {
 		return &database.APIKeyRow{
 			ID:   0,
 			Name: "config",
 			Key:  key,
-		}, true
+		}, true, nil
 	}
 	if row, ok := h.resolveAPIKeyFromRuntimeCache(key); ok {
 		h.syncAPIKeyAllowedGroups(row)
-		return row, true
+		return row, true, nil
 	}
 	if h.db == nil {
-		return nil, false
+		return nil, false, nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	row, err := h.db.GetAPIKeyByValue(ctx, key)
 	if err != nil {
-		if !errors.Is(err, sql.ErrNoRows) {
-			log.Printf("查询 API Key 失败: %v", err)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, false, nil
 		}
-		return nil, false
+		// DB 故障（连接耗尽/超时/网络）：上报错误让调用方回 503，不当成 key 无效。
+		log.Printf("查询 API Key 失败: %v", err)
+		return nil, false, err
 	}
 	h.setAPIKeyRuntimeCache(row)
 	h.syncAPIKeyAllowedGroups(row)
-	return row, true
+	return row, true, nil
 }
 
 func (h *Handler) resolveAPIKeyFromRuntimeCache(key string) (*database.APIKeyRow, bool) {
@@ -477,11 +533,12 @@ func (h *Handler) syncAPIKeyAllowedGroups(row *database.APIKeyRow) {
 		return
 	}
 	h.store.SetAPIKeyAllowedGroups(row.ID, row.AllowedGroupIDs)
+	h.store.SetAPIKeyAllowedPlans(row.ID, row.Limits.PlanAllow)
 }
 
-// isValidKey 检查 key 是否有效（配置文件 + DB）
+// isValidKey 检查 key 是否有效（配置文件 + DB）。DB 故障时保守返回 false。
 func (h *Handler) isValidKey(key string) bool {
-	_, ok := h.resolveAPIKey(key)
+	_, ok, _ := h.resolveAPIKey(key)
 	return ok
 }
 
@@ -769,6 +826,16 @@ type streamOutcome struct {
 	failureKind    string
 	failureMessage string
 	penalize       bool
+	// verifyAccountAuth 标记这是一次 WS 上游读流失败（如 close 1008 policy violation）。
+	// WS 通道下 token 失效表现为上游主动关闭而非 401，需异步跑一次探针确认账号鉴权状态，
+	// 命中 401 才按 unauthorized 冷却，避免失效账号不被封、反复被调度。
+	verifyAccountAuth bool
+}
+
+// isWebsocketUpstreamClose 判断读流错误是否来自 WS 上游异常关闭/读失败。
+// wsrelay 的读错误统一以 "websocket read error:" 前缀包裹（见 wsrelay/executor.go）。
+func isWebsocketUpstreamClose(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "websocket read error")
 }
 
 func classifyStreamOutcome(ctxErr, readErr, writeErr error, gotTerminal bool) streamOutcome {
@@ -798,10 +865,11 @@ func classifyStreamOutcome(ctxErr, readErr, writeErr error, gotTerminal bool) st
 			kind = "transport"
 		}
 		return streamOutcome{
-			logStatusCode:  logStatusUpstreamStreamBreak,
-			failureKind:    kind,
-			failureMessage: fmt.Sprintf("上游流读取失败: %v", readErr),
-			penalize:       true,
+			logStatusCode:     logStatusUpstreamStreamBreak,
+			failureKind:       kind,
+			failureMessage:    fmt.Sprintf("上游流读取失败: %v", readErr),
+			penalize:          true,
+			verifyAccountAuth: isWebsocketUpstreamClose(readErr),
 		}
 	}
 
@@ -908,6 +976,15 @@ func responseFailedStatusCode(payload []byte) int {
 		return http.StatusPaymentRequired
 	case strings.Contains(codeOrType, "forbidden"):
 		return http.StatusForbidden
+	// 确定性客户端错误：输入超上下文窗口/字段超长/模型不存在等，换号重试
+	// 也必然失败。归为 400，避免落入 default 500 触发透明重试并惩罚账号
+	// 健康度 (issue #310)。
+	case strings.Contains(codeOrType, "context_length") ||
+		strings.Contains(codeOrType, "context_window") ||
+		strings.Contains(codeOrType, "above_max_length") ||
+		strings.Contains(codeOrType, "model_not_found") ||
+		strings.Contains(codeOrType, "unsupported"):
+		return http.StatusBadRequest
 	case strings.Contains(codeOrType, "invalid") || strings.Contains(codeOrType, "bad_request"):
 		return http.StatusBadRequest
 	default:
@@ -1220,7 +1297,14 @@ func (h *Handler) authMiddleware() gin.HandlerFunc {
 		authHeader = security.SanitizeInput(authHeader)
 
 		key := strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
-		apiKeyRow, ok := h.resolveAPIKey(key)
+		apiKeyRow, ok, resolveErr := h.resolveAPIKey(key)
+		if resolveErr != nil {
+			// DB/基础设施暂时性故障：返回 503，不当成客户端 key 无效（issue #323）。
+			// 不记 AUTH_FAILED 审计日志，避免污染凭证攻击告警。
+			api.SendError(c, api.ErrServiceUnavailable)
+			c.Abort()
+			return
+		}
 		if !ok {
 			// 记录安全审计日志（脱敏）
 			maskedKey := security.MaskAPIKey(key)
@@ -1422,7 +1506,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	// Validate request
 	validator := api.NewValidator(rawBody)
 	rules := api.ResponsesAPIValidationRulesForModel(mappedModel)
-	rules["model"] = append(rules["model"], api.ModelValidator(supportedModels))
+	rules["model"] = append(rules["model"], h.modelValidator(supportedModels))
 	result := validator.ValidateRequest(rules)
 	if !result.Valid {
 		api.SendError(c, validator.ToAPIError())
@@ -1477,7 +1561,9 @@ func (h *Handler) Responses(c *gin.Context) {
 
 	// 2. 准备 Codex 上游请求体（Unmarshal→map→Marshal，一次序列化）。
 	// OpenAI Responses relay body 仅在实际命中 relay 账号时惰性生成，避免 Codex 路径重复转换。
-	codexBody, expandedInputRaw := PrepareResponsesBody(rawBody)
+	// previous_response_id 缓存按下游 API Key 隔离，防止跨用户注入他人对话历史。
+	respCacheOwner := responseCacheOwner(apiKeyID)
+	codexBody, expandedInputRaw := PrepareResponsesBodyForOwner(rawBody, respCacheOwner)
 	var openAIResponsesBody []byte
 	resetOpenAIResponsesBody := func() {
 		openAIResponsesBody = nil
@@ -1504,7 +1590,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	if releaseAPIKeyConcurrency != nil {
 		defer releaseAPIKeyConcurrency()
 	}
-	accountFilter := accountFilterForResponsesModel(effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
+	accountFilter := accountFilterForResponsesModelWithOriginal(logModel, effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
 
 	// 3. 带重试的上游请求
@@ -1541,9 +1627,12 @@ func (h *Handler) Responses(c *gin.Context) {
 		start := time.Now()
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
 		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
+		attemptEffectiveModel := effectiveModel
+		attemptLogEffectiveModel := logEffectiveModel
 		useWebsocket := h.shouldUseWebsocketForHTTP() && !forceHTTPAfterWSMessageTooBig
-		// 显式生图请求强制走 HTTP：WebSocket 传输大体积图片数据会卡死（issue #220）。
-		if useWebsocket && explicitlyRequestsImageGeneration(rawBody) {
+		// 生图请求强制走 HTTP：WebSocket 传输大体积图片数据会卡死（issue #220）；
+		// 自然语言生图意图也需保留 image_generation 工具（issue #288）。
+		if useWebsocket && rawResponsesBodyShouldForceHTTPForImageGeneration(rawBody) {
 			useWebsocket = false
 		}
 
@@ -1582,7 +1671,13 @@ func (h *Handler) Responses(c *gin.Context) {
 			}
 			baseURL, _ := account.OpenAIResponsesCredentials()
 			upstreamEndpoint := auth.OpenAIResponsesEndpoint(baseURL, "/v1/responses")
-			resp, reqErr := ExecuteOpenAIResponsesRequest(upstreamCtx, account, getOpenAIResponsesBody(), proxyURL, downstreamHeaders)
+			upstreamBody := getOpenAIResponsesBody()
+			if mappedBody, mappedModel, ok := h.applyAccountModelMappingToBodyForModels(upstreamBody, account, logModel, effectiveModel); ok {
+				upstreamBody = mappedBody
+				attemptEffectiveModel = mappedModel
+				attemptLogEffectiveModel = usageEffectiveModelForMapping(logModel, attemptEffectiveModel, true)
+			}
+			resp, reqErr := ExecuteOpenAIResponsesRequest(upstreamCtx, account, upstreamBody, proxyURL, downstreamHeaders)
 			durationMs := int(time.Since(start).Milliseconds())
 
 			if reqErr != nil {
@@ -1662,14 +1757,14 @@ func (h *Handler) Responses(c *gin.Context) {
 				log.Printf("OpenAI Responses 上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, upstreamErrorConsoleBody(errBody))
 				logUpstreamError("/v1/responses", resp.StatusCode, logModel, account.ID(), errBody)
 				h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, errBody)
-				decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
+				decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
 				shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 				usageTiers := resolveUsageServiceTiers("", serviceTier)
 				h.logUsageForRequest(c, &database.UsageLogInput{
 					AccountID:            account.ID(),
 					Endpoint:             "/v1/responses",
 					Model:                logModel,
-					EffectiveModel:       logEffectiveModel,
+					EffectiveModel:       attemptLogEffectiveModel,
 					StatusCode:           resp.StatusCode,
 					DurationMs:           durationMs,
 					ReasoningEffort:      reasoningEffort,
@@ -1800,10 +1895,13 @@ func (h *Handler) Responses(c *gin.Context) {
 				outcome = firstTokenTimeoutOutcome(currentFirstTokenTimeout())
 			}
 			ttftGuard.Stop()
+			if outcome.verifyAccountAuth {
+				h.store.VerifyAccountAuthAsync(account)
+			}
 			var responseFailedDecision codex429Decision
 			if len(terminalFailurePayload) > 0 {
 				outcome = classifyResponseFailedOutcome(terminalFailurePayload)
-				responseFailedDecision = h.applyResponseFailedCooldown(account, terminalFailurePayload, resp, effectiveModel)
+				responseFailedDecision = h.applyResponseFailedCooldown(account, terminalFailurePayload, resp, attemptEffectiveModel)
 				if responseFailedDecision.Reason != "" {
 					outcome.failureKind = upstreamErrorKind(outcome.logStatusCode, responseFailedErrorBody(terminalFailurePayload), responseFailedDecision)
 				}
@@ -1850,7 +1948,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				AccountID:            account.ID(),
 				Endpoint:             "/v1/responses",
 				Model:                logModel,
-				EffectiveModel:       logEffectiveModel,
+				EffectiveModel:       attemptLogEffectiveModel,
 				StatusCode:           outcome.logStatusCode,
 				DurationMs:           totalDuration,
 				FirstTokenMs:         firstTokenMs,
@@ -1886,7 +1984,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			} else if outcome.logStatusCode == http.StatusOK {
-				h.store.ClearModelCooldown(account, effectiveModel)
+				h.store.ClearModelCooldown(account, attemptEffectiveModel)
 				h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 			}
 			h.store.Release(account)
@@ -2103,7 +2201,7 @@ func (h *Handler) Responses(c *gin.Context) {
 						actualServiceTier = tier
 					}
 					// 缓存响应上下文，供后续 previous_response_id 展开使用
-					cacheCompletedResponse([]byte(expandedInputRaw), data)
+					cacheCompletedResponse(respCacheOwner, []byte(expandedInputRaw), data)
 					gotTerminal = true
 				}
 				if eventType == "response.failed" {
@@ -2162,7 +2260,7 @@ func (h *Handler) Responses(c *gin.Context) {
 						actualServiceTier = tier
 					}
 					// 缓存响应上下文，供后续 previous_response_id 展开使用
-					cacheCompletedResponse([]byte(expandedInputRaw), data)
+					cacheCompletedResponse(respCacheOwner, []byte(expandedInputRaw), data)
 					gotTerminal = true
 					lastResponseData = data
 					return false
@@ -2194,6 +2292,9 @@ func (h *Handler) Responses(c *gin.Context) {
 			outcome = firstTokenTimeoutOutcome(currentFirstTokenTimeout())
 		}
 		ttftGuard.Stop()
+		if outcome.verifyAccountAuth {
+			h.store.VerifyAccountAuthAsync(account)
+		}
 		var responseFailedDecision codex429Decision
 		if len(terminalFailurePayload) > 0 {
 			outcome = classifyResponseFailedOutcome(terminalFailurePayload)
@@ -2318,13 +2419,16 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	}
 
 	supportedModels := h.supportedModelIDs(c.Request.Context())
+	// newapi 等聚合网关会给 compact 请求追加 -openai-compact 后缀（如 gpt-5.4-openai-compact）。
+	// 在映射与校验之前剥除后缀，让 newapi 渠道保持该命名，而内部按基础模型 gpt-5.4 处理并转发上游。
+	rawBody, _, _ = stripCompactModelSuffixFromBody(rawBody)
 	rawBody, requestModel, mappedModel, mappingApplied := h.applyConfiguredModelMappingToBody(rawBody, supportedModels)
 	setRawRequestBody(c, rawBody)
 
 	// Validate request
 	validator := api.NewValidator(rawBody)
 	rules := api.ResponsesAPIValidationRulesForModel(mappedModel)
-	rules["model"] = append(rules["model"], api.ModelValidator(supportedModels))
+	rules["model"] = append(rules["model"], h.modelValidator(supportedModels))
 	result := validator.ValidateRequest(rules)
 	if !result.Valid {
 		api.SendError(c, validator.ToAPIError())
@@ -2378,8 +2482,8 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	// compact 强制非流式
 	rawBody, _ = sjson.SetBytes(rawBody, "stream", false)
 
-	// 准备上游请求体
-	codexBody, _ := PrepareCompactResponsesBody(rawBody)
+	// 准备上游请求体（previous_response_id 缓存按下游 API Key 隔离）
+	codexBody, _ := PrepareCompactResponsesBodyForOwner(rawBody, responseCacheOwner(apiKeyID))
 	if err := validateResponsesImageGenerationSizes(codexBody); err != nil {
 		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidParameter, err.Error(), api.ErrorTypeInvalidRequest))
 		return
@@ -2398,7 +2502,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	}
 	// compact 同时允许官方 Codex OAuth 账号与中转（OpenAI Responses API）账号：
 	// 中转账号会命中上游自身的 /responses/compact，使仅接入中转的用户也能压缩（issue #174）。
-	accountFilter := accountFilterForResponsesModel(effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
+	accountFilter := accountFilterForResponsesModelWithOriginal(logModel, effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
 
 	// compact 走中转账号时需要 OpenAI Responses 形态的请求体
@@ -2431,6 +2535,8 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		start := time.Now()
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
 		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
+		attemptEffectiveModel := effectiveModel
+		attemptLogEffectiveModel := logEffectiveModel
 
 		apiKey := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
 		apiKey = strings.TrimSpace(apiKey)
@@ -2443,7 +2549,13 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		if account.IsOpenAIResponsesAPI() {
 			baseURL, _ := account.OpenAIResponsesCredentials()
 			upstreamEndpoint := auth.OpenAIResponsesEndpoint(baseURL, "/v1/responses/compact")
-			resp, reqErr := ExecuteOpenAIResponsesCompactRequest(c.Request.Context(), account, openAIResponsesBody, proxyURL, downstreamHeaders)
+			upstreamBody := openAIResponsesBody
+			if mappedBody, mappedModel, ok := h.applyAccountModelMappingToBodyForModels(upstreamBody, account, logModel, effectiveModel); ok {
+				upstreamBody = mappedBody
+				attemptEffectiveModel = mappedModel
+				attemptLogEffectiveModel = usageEffectiveModelForMapping(logModel, attemptEffectiveModel, true)
+			}
+			resp, reqErr := ExecuteOpenAIResponsesCompactRequest(c.Request.Context(), account, upstreamBody, proxyURL, downstreamHeaders)
 			durationMs := int(time.Since(start).Milliseconds())
 
 			if reqErr != nil {
@@ -2499,14 +2611,14 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 
 				logUpstreamError("/v1/responses/compact", resp.StatusCode, logModel, account.ID(), errBody)
 				h.logUpstreamCyberPolicy(c, "/v1/responses/compact", logModel, errBody)
-				decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
+				decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
 				shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 				usageTiers := resolveUsageServiceTiers("", serviceTier)
 				h.logUsageForRequest(c, &database.UsageLogInput{
 					AccountID:            account.ID(),
 					Endpoint:             "/v1/responses/compact",
 					Model:                logModel,
-					EffectiveModel:       logEffectiveModel,
+					EffectiveModel:       attemptLogEffectiveModel,
 					StatusCode:           resp.StatusCode,
 					DurationMs:           durationMs,
 					ReasoningEffort:      reasoningEffort,
@@ -2551,7 +2663,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 					AccountID:            account.ID(),
 					Endpoint:             "/v1/responses/compact",
 					Model:                logModel,
-					EffectiveModel:       logEffectiveModel,
+					EffectiveModel:       attemptLogEffectiveModel,
 					StatusCode:           http.StatusBadGateway,
 					DurationMs:           totalDuration,
 					ReasoningEffort:      reasoningEffort,
@@ -2576,7 +2688,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				return
 			}
 
-			h.store.ClearModelCooldown(account, effectiveModel)
+			h.store.ClearModelCooldown(account, attemptEffectiveModel)
 			h.store.ReportRequestSuccess(account, time.Duration(durationMs)*time.Millisecond)
 
 			promptTokens := int(gjson.GetBytes(respBody, "usage.input_tokens").Int())
@@ -2598,7 +2710,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				AccountID:            account.ID(),
 				Endpoint:             "/v1/responses/compact",
 				Model:                logModel,
-				EffectiveModel:       logEffectiveModel,
+				EffectiveModel:       attemptLogEffectiveModel,
 				StatusCode:           http.StatusOK,
 				DurationMs:           durationMs,
 				PromptTokens:         promptTokens,
@@ -2823,7 +2935,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	// Validate request
 	validator := api.NewValidator(rawBody)
 	rules := api.ChatCompletionValidationRules()
-	rules["model"] = append(rules["model"], api.ModelValidator(supportedModels))
+	rules["model"] = append(rules["model"], h.modelValidator(supportedModels))
 	result := validator.ValidateRequest(rules)
 	if !result.Valid {
 		api.SendError(c, validator.ToAPIError())
@@ -2895,7 +3007,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	}
 	// /v1/chat/completions 同时允许官方 Codex OAuth 账号与中转（OpenAI Responses API）账号：
 	// 翻译后的请求体本身就是 Responses 形态，中转账号直接以 HTTP 转发（issue #181）。
-	accountFilter := accountFilterForResponsesModel(effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
+	accountFilter := accountFilterForResponsesModelWithOriginal(logModel, effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
 
 	sessionID := ResolveSessionID(c.Request.Header, codexBody)
@@ -2937,9 +3049,12 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
 		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
 		isRelayAccount := account.IsOpenAIResponsesAPI()
+		attemptEffectiveModel := effectiveModel
+		attemptLogEffectiveModel := logEffectiveModel
 		useWebsocket := h.shouldUseWebsocketForHTTP() && !forceHTTPAfterWSMessageTooBig && !isRelayAccount
-		// 显式生图请求强制走 HTTP：WebSocket 传输大体积图片数据会卡死（issue #220）。
-		if useWebsocket && explicitlyRequestsImageGeneration(codexBody) {
+		// 真实生图意图强制走 HTTP：WebSocket 传输大体积图片数据会卡死（issue #220）。
+		// 仅凭注入的 image_generation 工具不触发降级，普通请求继续走 WS（issue #304）。
+		if useWebsocket && rawResponsesBodyShouldForceHTTPForImageGeneration(codexBody) {
 			useWebsocket = false
 		}
 		upstreamEndpoint := "/v1/responses"
@@ -2977,7 +3092,13 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		var resp *http.Response
 		var reqErr error
 		if isRelayAccount {
-			resp, reqErr = ExecuteOpenAIResponsesRequest(upstreamCtx, account, codexBody, proxyURL, downstreamHeaders)
+			upstreamBody := codexBody
+			if mappedBody, mappedModel, ok := h.applyAccountModelMappingToBodyForModels(upstreamBody, account, logModel, effectiveModel); ok {
+				upstreamBody = mappedBody
+				attemptEffectiveModel = mappedModel
+				attemptLogEffectiveModel = usageEffectiveModelForMapping(logModel, attemptEffectiveModel, true)
+			}
+			resp, reqErr = ExecuteOpenAIResponsesRequest(upstreamCtx, account, upstreamBody, proxyURL, downstreamHeaders)
 		} else {
 			// WebSocket 上游下剥离自动注入的图片工具，防止模型自主生图卡死 WS 流（issue #220）。
 			upstreamBody := codexBody
@@ -3050,14 +3171,14 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			log.Printf("上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, upstreamErrorConsoleBody(errBody))
 			logUpstreamError("/v1/chat/completions", resp.StatusCode, logModel, account.ID(), errBody)
 			h.logUpstreamCyberPolicy(c, "/v1/chat/completions", logModel, errBody)
-			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
+			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
 			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:            account.ID(),
 				Endpoint:             "/v1/chat/completions",
 				Model:                logModel,
-				EffectiveModel:       logEffectiveModel,
+				EffectiveModel:       attemptLogEffectiveModel,
 				StatusCode:           resp.StatusCode,
 				DurationMs:           durationMs,
 				ReasoningEffort:      reasoningEffort,
@@ -3255,10 +3376,13 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			outcome = firstTokenTimeoutOutcome(currentFirstTokenTimeout())
 		}
 		ttftGuard.Stop()
+		if outcome.verifyAccountAuth {
+			h.store.VerifyAccountAuthAsync(account)
+		}
 		var responseFailedDecision codex429Decision
 		if len(terminalFailurePayload) > 0 {
 			outcome = classifyResponseFailedOutcome(terminalFailurePayload)
-			responseFailedDecision = h.applyResponseFailedCooldown(account, terminalFailurePayload, resp, effectiveModel)
+			responseFailedDecision = h.applyResponseFailedCooldown(account, terminalFailurePayload, resp, attemptEffectiveModel)
 			if responseFailedDecision.Reason != "" {
 				outcome.failureKind = upstreamErrorKind(outcome.logStatusCode, responseFailedErrorBody(terminalFailurePayload), responseFailedDecision)
 			}
@@ -3325,7 +3449,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			AccountID:            account.ID(),
 			Endpoint:             "/v1/chat/completions",
 			Model:                logModel,
-			EffectiveModel:       logEffectiveModel,
+			EffectiveModel:       attemptLogEffectiveModel,
 			StatusCode:           logStatusCode,
 			DurationMs:           totalDuration,
 			FirstTokenMs:         firstTokenMs,
@@ -3360,7 +3484,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 		} else if outcome.logStatusCode == http.StatusOK {
-			h.store.ClearModelCooldown(account, effectiveModel)
+			h.store.ClearModelCooldown(account, attemptEffectiveModel)
 			h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 		}
 		h.store.Release(account)
@@ -3809,8 +3933,8 @@ func compute429Cooldown(account *auth.Account, body []byte, resp *http.Response)
 		// Free 只有 7d 窗口，429 = 额度耗尽，冷却 7 天
 		return 7 * 24 * time.Hour
 
-	case "team", "teamplus", "pro", "plus", "enterprise":
-		// Team/Pro/Plus 有 5h + 7d 双窗口，需要判断是哪个窗口触发了限制
+	case "team", "teamplus", "pro", "plus", "enterprise", "k12", "edu", "education":
+		// Team/Pro/Plus 及教育版(k12/edu)有 5h + 7d 双窗口，需要判断是哪个窗口触发了限制
 		return detectTeamCooldownWindow(resp)
 
 	default:
@@ -3894,7 +4018,11 @@ func SyncCodexUsageState(store *auth.Store, account *auth.Account, resp *http.Re
 	}
 
 	result.UsagePct5h, result.Reset5hAt, result.HasUsage5h = account.GetUsageSnapshot5h()
-	if result.Used5hHeaders && account.IsPremium5hPlan() && result.HasUsage5h && result.UsagePct5h >= 100 {
+	if store != nil && result.HasUsage5h {
+		// 被动 /responses 头刷新了 5h 窗口重置时刻：武装「到点即探」，窗口翻新即刷新进度条。
+		store.WakeBoundaryProbe(result.Reset5hAt)
+	}
+	if result.Used5hHeaders && account.IsPremium5hPlan() && result.HasUsage5h && result.UsagePct5h >= 100 && !account.SkipsUsageWindowLimits() {
 		if store != nil {
 			store.MarkPremium5hRateLimited(account, result.Reset5hAt)
 		}
@@ -3955,6 +4083,7 @@ func parseCodexUsageHeaders(resp *http.Response, account *auth.Account) (float64
 	if w7d.valid {
 		resetAt := now.Add(time.Duration(w7d.resetSec) * time.Second)
 		account.SetReset7dAt(resetAt)
+		account.SetWindow7dSeconds(int64(w7d.windowMin * 60))
 		account.SetUsagePercent7d(w7d.usedPct)
 		return w7d.usedPct, true
 	}
@@ -4017,6 +4146,20 @@ func (h *Handler) sendFinalUpstreamError(c *gin.Context, statusCode int, body []
 		return
 	}
 
+	// 上游账号 401（OAuth token 失效/撤销）是账号侧问题，不是下游客户端 key 无效。
+	// 若原样以 401 透传，客户端会误判自己的凭证失效（issue #323）。改写为 503 池级
+	// 错误，用独立 code/type 与客户端鉴权失败（invalid_api_key）明确区分。
+	if statusCode == http.StatusUnauthorized && !isMissingScopeUnauthorized(body) {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error": gin.H{
+				"message": "账号池暂无可用账号（上游账号鉴权失效），请稍后重试",
+				"type":    "server_error",
+				"code":    "account_pool_unauthorized",
+			},
+		})
+		return
+	}
+
 	h.sendUpstreamError(c, statusCode, body)
 }
 
@@ -4064,6 +4207,17 @@ func (h *Handler) supportedModelIDs(ctx context.Context) []string {
 				}
 				seen[key] = struct{}{}
 				models = append(models, model)
+			}
+			for _, alias := range accountModelMappingAliases(account) {
+				key := strings.ToLower(strings.TrimSpace(alias))
+				if key == "" {
+					continue
+				}
+				if _, exists := seen[key]; exists {
+					continue
+				}
+				seen[key] = struct{}{}
+				models = append(models, alias)
 			}
 		}
 	}

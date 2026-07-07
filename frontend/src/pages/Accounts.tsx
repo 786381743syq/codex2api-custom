@@ -30,6 +30,7 @@ import type {
 } from "../types";
 import { getErrorMessage } from "../utils/error";
 import { formatRelativeTime, formatBeijingTime } from "../utils/time";
+import { formatLongUsageWindowLabel } from "../lib/usageFormat";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -133,7 +134,29 @@ const ACCOUNT_GROUP_COLORS = [
   "#0891b2",
   "#64748b",
 ] as const;
+const CUSTOM_HEADERS_PLACEHOLDER = `{
+  "Authorization": "Bearer upstream-token",
+  "X-Custom-Header": "value"
+}`;
+const MODEL_MAPPING_PLACEHOLDER = `{
+  "client-model": "upstream-model",
+  "legacy-*": "gpt-4.1"
+}`;
 type AccountTableColumn = (typeof ACCOUNT_TABLE_COLUMNS)[number];
+type CustomHeadersParseResult =
+  | { ok: true; value: Record<string, string> | null }
+  | { ok: false };
+type ModelMappingParseResult =
+  | { ok: true; value: string }
+  | { ok: false };
+type ModelMappingEntriesParseResult =
+  | { ok: true; entries: ModelMappingEntry[] }
+  | { ok: false };
+type ModelMappingMode = "form" | "json";
+type ModelMappingEntry = {
+  from: string;
+  to: string;
+};
 type AccountGroupDraft = {
   id: number | null;
   name: string;
@@ -312,6 +335,140 @@ function parseModelTokens(value: string): string[] {
     });
 }
 
+function formatCustomHeadersText(
+  headers?: Record<string, string> | null,
+): string {
+  if (!headers || Object.keys(headers).length === 0) return "";
+  return JSON.stringify(headers, null, 2);
+}
+
+function parseCustomHeadersText(value: string): CustomHeadersParseResult {
+  const trimmed = value.trim();
+  if (!trimmed) return { ok: true, value: null };
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return { ok: false };
+  }
+
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { ok: false };
+  }
+
+  const entries = Object.entries(parsed as Record<string, unknown>);
+  if (entries.some(([, headerValue]) => typeof headerValue !== "string")) {
+    return { ok: false };
+  }
+
+  return {
+    ok: true,
+    value: Object.fromEntries(entries) as Record<string, string>,
+  };
+}
+
+function emptyModelMappingEntries(): ModelMappingEntry[] {
+  return [{ from: "", to: "" }];
+}
+
+function parseModelMappingEntries(value: string): ModelMappingEntriesParseResult {
+  const trimmed = value.trim();
+  if (!trimmed) return { ok: true, entries: emptyModelMappingEntries() };
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return { ok: false };
+  }
+
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { ok: false };
+  }
+
+  const entries = Object.entries(parsed as Record<string, unknown>);
+  if (
+    entries.some(
+      ([from, to]) => !from.trim() || typeof to !== "string" || !to.trim(),
+    )
+  ) {
+    return { ok: false };
+  }
+
+  return {
+    ok: true,
+    entries:
+      entries.length > 0
+        ? entries.map(([from, to]) => ({
+            from,
+            to: String(to),
+          }))
+        : emptyModelMappingEntries(),
+  };
+}
+
+function parseModelMappingText(value: string): ModelMappingParseResult {
+  const trimmed = value.trim();
+  if (!trimmed) return { ok: true, value: "" };
+  if (!parseModelMappingEntries(trimmed).ok) return { ok: false };
+  return { ok: true, value: trimmed };
+}
+
+function exactModelMappingAliases(
+  value?: string,
+  supportedModels: string[] = [],
+): string[] {
+  const parsed = parseModelMappingEntries(value ?? "");
+  if (!parsed.ok) return [];
+  const supported = new Set(
+    supportedModels.map((model) => model.trim().toLowerCase()).filter(Boolean),
+  );
+  return parsed.entries
+    .filter((entry) => {
+      const alias = entry.from.trim();
+      const target = entry.to.trim().toLowerCase();
+      return (
+        alias &&
+        !alias.includes("*") &&
+        isConnectionTestModel(alias) &&
+        (supported.size === 0 || supported.has(target))
+      );
+    })
+    .map((entry) => entry.from.trim());
+}
+
+function serializeModelMappingEntries(
+  entries: ModelMappingEntry[],
+): ModelMappingParseResult {
+  const out: Record<string, string> = {};
+  const seen = new Set<string>();
+  for (const entry of entries) {
+    const from = entry.from.trim();
+    const to = entry.to.trim();
+    if (!from && !to) continue;
+    if (!from || !to) return { ok: false };
+    const key = from.toLowerCase();
+    if (seen.has(key)) return { ok: false };
+    seen.add(key);
+    out[from] = to;
+  }
+  if (Object.keys(out).length === 0) {
+    return { ok: true, value: "" };
+  }
+  return { ok: true, value: JSON.stringify(out, null, 2) };
+}
+
+function resolveModelMappingValue(
+  mode: ModelMappingMode,
+  text: string,
+  entries: ModelMappingEntry[],
+): ModelMappingParseResult {
+  return mode === "json"
+    ? parseModelMappingText(text)
+    : serializeModelMappingEntries(entries);
+}
+
 function mergeModelLists(current: string[], incoming: string[]): string[] {
   const seen = new Set<string>();
   const result: string[] = [];
@@ -375,6 +532,27 @@ function percentThresholdInputToRatio(value: string): number | null {
   const parsed = Number(trimmed);
   if (!Number.isFinite(parsed) || parsed <= 0) return null;
   return parsed / 100;
+}
+
+function formatDispatchCountLimitInput(value?: number | null): string {
+  if (typeof value !== "number" || value <= 0) return "";
+  return String(Math.trunc(value));
+}
+
+function isDispatchCountLimitInputInvalid(value: string): boolean {
+  const trimmed = value.trim();
+  if (!trimmed) return false;
+  if (!/^\d+$/.test(trimmed)) return true;
+  const parsed = Number.parseInt(trimmed, 10);
+  return parsed < 0 || parsed > 1000000;
+}
+
+function dispatchCountLimitInputToValue(value: string): number | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const parsed = Number.parseInt(trimmed, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return parsed;
 }
 
 function getMediaQueryMatch(query: string): boolean {
@@ -513,7 +691,7 @@ export default function Accounts() {
   >("all");
   const [searchQuery, setSearchQuery] = useState("");
   const [planFilter, setPlanFilter] = useState<
-    "all" | "pro" | "prolite" | "plus" | "team" | "free"
+    "all" | "pro" | "prolite" | "plus" | "team" | "k12" | "free"
   >("all");
   const [sortKey, setSortKey] = useState<
     "requests" | "usage" | "importTime" | null
@@ -524,6 +702,7 @@ export default function Accounts() {
     session_token: "",
     proxy_url: "",
   });
+  const [addCustomHeadersText, setAddCustomHeadersText] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [refreshingIds, setRefreshingIds] = useState<Set<number>>(new Set());
@@ -572,10 +751,13 @@ export default function Accounts() {
     useState(false);
   const [editAutoPause7dDisabled, setEditAutoPause7dDisabled] =
     useState(false);
+  const [editDispatchCountLimitInput, setEditDispatchCountLimitInput] =
+    useState("");
   const [allowedAPIKeySelection, setAllowedAPIKeySelection] = useState<
     number[]
   >([]);
   const [editProxyUrl, setEditProxyUrl] = useState("");
+  const [editCustomHeadersText, setEditCustomHeadersText] = useState("");
   const [testingProxyKey, setTestingProxyKey] = useState<string | null>(null);
   const [editOpenAIForm, setEditOpenAIForm] =
     useState<UpdateOpenAIResponsesAccountRequest>({
@@ -587,10 +769,20 @@ export default function Accounts() {
     });
   const [openAIModelDraft, setOpenAIModelDraft] = useState("");
   const [editOpenAIModelDraft, setEditOpenAIModelDraft] = useState("");
+  const [editOpenAIModelMappingText, setEditOpenAIModelMappingText] =
+    useState("");
+  const [editOpenAIModelMappingMode, setEditOpenAIModelMappingMode] =
+    useState<ModelMappingMode>("form");
+  const [editOpenAIModelMappingEntries, setEditOpenAIModelMappingEntries] =
+    useState<ModelMappingEntry[]>(emptyModelMappingEntries);
   const [editOpenAIModelsLoading, setEditOpenAIModelsLoading] = useState(false);
   const [importing, setImporting] = useState(false);
   const [showImportPicker, setShowImportPicker] = useState(false);
+  const [importProxyUrl, setImportProxyUrl] = useState("");
+  const [importCustomHeadersText, setImportCustomHeadersText] = useState("");
   const [showSub2APIImport, setShowSub2APIImport] = useState(false);
+  const [showPasteImport, setShowPasteImport] = useState(false);
+  const [pasteImportText, setPasteImportText] = useState("");
   const [dragging, setDragging] = useState(false);
   const dragCounter = useRef(0);
   const [showExportPicker, setShowExportPicker] = useState(false);
@@ -612,6 +804,7 @@ export default function Accounts() {
     current: number;
     total: number;
     success: number;
+    updated: number;
     duplicate: number;
     failed: number;
     done: boolean;
@@ -620,17 +813,22 @@ export default function Accounts() {
     current: 0,
     total: 0,
     success: 0,
+    updated: 0,
     duplicate: 0,
     failed: 0,
     done: false,
   });
   const [addMethod, setAddMethod] = useState<
-    "rt" | "st" | "at" | "openai" | "oauth"
+    "rt" | "st" | "at" | "session" | "openai" | "oauth"
   >("oauth");
   const [atForm, setAtForm] = useState<AddATAccountRequest>({
     access_token: "",
     proxy_url: "",
   });
+  const [sessionJson, setSessionJson] = useState("");
+  const [sessionProxyUrl, setSessionProxyUrl] = useState("");
+  // 允许重复添加：勾选后本次添加/导入跳过去重，强制新建（添加弹窗与导入弹窗共用）。
+  const [allowDuplicate, setAllowDuplicate] = useState(false);
   const [openAIForm, setOpenAIForm] =
     useState<AddOpenAIResponsesAccountRequest>({
       base_url: "https://api.openai.com",
@@ -638,6 +836,12 @@ export default function Accounts() {
       models: [],
       proxy_url: "",
     });
+  const [openAIModelMappingText, setOpenAIModelMappingText] = useState("");
+  const [openAIModelMappingMode, setOpenAIModelMappingMode] =
+    useState<ModelMappingMode>("form");
+  const [openAIModelMappingEntries, setOpenAIModelMappingEntries] = useState<
+    ModelMappingEntry[]
+  >(emptyModelMappingEntries);
   const [openAIModelsLoading, setOpenAIModelsLoading] = useState(false);
   const [oauthStep, setOauthStep] = useState<"generate" | "exchange">(
     "generate",
@@ -807,6 +1011,214 @@ export default function Accounts() {
           </Button>
         </div>
       </div>
+    );
+  };
+
+  const renderCustomHeadersTextarea = ({
+    value,
+    onChange,
+  }: {
+    value: string;
+    onChange: (value: string) => void;
+  }) => (
+    <div>
+      <div className="flex items-center justify-between mb-2">
+        <label className="block text-sm font-semibold text-muted-foreground">
+          上游自定义请求头 JSON
+        </label>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          onClick={() => onChange(CUSTOM_HEADERS_PLACEHOLDER)}
+        >
+          插入模板
+        </Button>
+      </div>
+      <textarea
+        className="w-full min-h-[140px] p-3 border border-input rounded-xl bg-background text-sm resize-y font-mono focus:outline-none focus:ring-2 focus:ring-ring"
+        placeholder={CUSTOM_HEADERS_PLACEHOLDER}
+        value={value}
+        onChange={(event: ChangeEvent<HTMLTextAreaElement>) =>
+          onChange(event.target.value)
+        }
+        rows={6}
+        spellCheck={false}
+      />
+      <p className="mt-1.5 text-xs text-muted-foreground">
+        留空表示不设置；JSON 必须是对象，所有请求头值都必须是字符串。
+      </p>
+    </div>
+  );
+
+  const renderModelMappingEditor = ({
+    value,
+    onChange,
+    mode,
+    onModeChange,
+    entries,
+    onEntriesChange,
+  }: {
+    value: string;
+    onChange: (value: string) => void;
+    mode: ModelMappingMode;
+    onModeChange: (value: ModelMappingMode) => void;
+    entries: ModelMappingEntry[];
+    onEntriesChange: (value: ModelMappingEntry[]) => void;
+  }) => {
+    const switchToForm = () => {
+      const parsed = parseModelMappingEntries(value);
+      if (!parsed.ok) {
+        showToast("当前 JSON 无法转成填空模式，请先修正 JSON", "error");
+        return;
+      }
+      onEntriesChange(parsed.entries);
+      onModeChange("form");
+    };
+
+    const switchToJSON = () => {
+      const serialized = serializeModelMappingEntries(entries);
+      if (!serialized.ok) {
+        showToast("模型映射行必须成对填写，源模型不能重复", "error");
+        return;
+      }
+      onChange(serialized.value);
+      onModeChange("json");
+    };
+
+    const updateEntry = (
+      index: number,
+      field: keyof ModelMappingEntry,
+      nextValue: string,
+    ) => {
+      onEntriesChange(
+        entries.map((entry, entryIndex) =>
+          entryIndex === index ? { ...entry, [field]: nextValue } : entry,
+        ),
+      );
+    };
+
+    const removeEntry = (index: number) => {
+      const next = entries.filter((_, entryIndex) => entryIndex !== index);
+      onEntriesChange(next.length > 0 ? next : emptyModelMappingEntries());
+    };
+
+    const insertTemplate = () => {
+      if (mode === "json") {
+        onChange(MODEL_MAPPING_PLACEHOLDER);
+        return;
+      }
+      onEntriesChange([
+        { from: "client-model", to: "upstream-model" },
+        { from: "legacy-*", to: "gpt-4.1" },
+      ]);
+    };
+
+    return (
+      <div>
+      <div className="flex items-center justify-between mb-2">
+        <label className="block text-sm font-semibold text-muted-foreground">
+          单渠道模型映射
+        </label>
+        <div className="flex items-center gap-2">
+          <div className="inline-flex rounded-lg border border-border bg-muted/40 p-0.5">
+            <button
+              type="button"
+              onClick={switchToForm}
+              className={`rounded-md px-2.5 py-1 text-xs font-semibold transition-colors ${
+                mode === "form"
+                  ? "bg-background text-foreground shadow-sm"
+                  : "text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              填空
+            </button>
+            <button
+              type="button"
+              onClick={switchToJSON}
+              className={`rounded-md px-2.5 py-1 text-xs font-semibold transition-colors ${
+                mode === "json"
+                  ? "bg-background text-foreground shadow-sm"
+                  : "text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              JSON
+            </button>
+          </div>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={insertTemplate}
+          >
+            插入模板
+          </Button>
+        </div>
+      </div>
+      {mode === "form" ? (
+        <div className="space-y-2">
+          {entries.map((entry, index) => (
+            <div
+              key={index}
+              className="grid grid-cols-1 gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]"
+            >
+              <Input
+                placeholder="客户端模型，如 client-model / legacy-*"
+                value={entry.from}
+                onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                  updateEntry(index, "from", event.target.value)
+                }
+              />
+              <Input
+                placeholder="上游模型，如 gpt-4.1"
+                value={entry.to}
+                onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                  updateEntry(index, "to", event.target.value)
+                }
+              />
+              <Button
+                type="button"
+                variant="outline"
+                size="icon"
+                className="h-10 w-10"
+                onClick={() => removeEntry(index)}
+                disabled={
+                  entries.length === 1 && !entry.from.trim() && !entry.to.trim()
+                }
+                title="删除映射"
+              >
+                <X className="size-4" />
+              </Button>
+            </div>
+          ))}
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() =>
+              onEntriesChange([...entries, { from: "", to: "" }])
+            }
+          >
+            <Plus className="size-3.5" />
+            添加映射
+          </Button>
+        </div>
+      ) : (
+        <textarea
+          className="w-full min-h-[140px] p-3 border border-input rounded-xl bg-background text-sm resize-y font-mono focus:outline-none focus:ring-2 focus:ring-ring"
+          placeholder={MODEL_MAPPING_PLACEHOLDER}
+          value={value}
+          onChange={(event: ChangeEvent<HTMLTextAreaElement>) =>
+            onChange(event.target.value)
+          }
+          rows={6}
+          spellCheck={false}
+        />
+      )}
+      <p className="mt-1.5 text-xs text-muted-foreground">
+        留空表示使用原模型；左侧是客户端请求模型，右侧是该渠道上游模型，支持 * 通配。JSON 模式格式为 {"{"}"client-model":"upstream-model"{"}"}。
+      </p>
+    </div>
     );
   };
 
@@ -1056,11 +1468,7 @@ export default function Accounts() {
       // 与 UsageCell 的显示判定保持一致:plan_type 可能滞后于真实订阅状态,
       // 看到 5h 重置时间就当订阅账号处理,触发拉取 5h 数据。
       const looksLikeSubscription =
-        plan === "pro" ||
-        plan === "team" ||
-        plan === "plus" ||
-        plan === "teamplus" ||
-        !!account.reset_5h_at;
+        isPremiumUsagePlan(plan) || !!account.reset_5h_at;
 
       if (looksLikeSubscription) {
         return !has5h || !has7d;
@@ -1373,10 +1781,25 @@ export default function Accounts() {
   }, [allPageSelected, pagedAccountIds]);
 
   const handleAdd = async (credential: "rt" | "st" = "rt") => {
+    const parsedCustomHeaders = parseCustomHeadersText(addCustomHeadersText);
+    if (!parsedCustomHeaders.ok) {
+      showToast("自定义请求头必须是 JSON 对象，且所有值必须是字符串", "error");
+      return;
+    }
     const payload: AddAccountRequest =
       credential === "st"
-        ? { ...addForm, refresh_token: "" }
-        : { ...addForm, session_token: "" };
+        ? {
+            ...addForm,
+            refresh_token: "",
+            allow_duplicate: allowDuplicate,
+            custom_headers: parsedCustomHeaders.value,
+          }
+        : {
+            ...addForm,
+            session_token: "",
+            allow_duplicate: allowDuplicate,
+            custom_headers: parsedCustomHeaders.value,
+          };
     if (
       !payload.refresh_token?.trim() &&
       !payload.session_token?.trim()
@@ -1398,6 +1821,7 @@ export default function Accounts() {
         await readImportSSE(res);
         showToast(t("accounts.addSuccess"));
         setAddForm({ refresh_token: "", session_token: "", proxy_url: "" });
+        setAddCustomHeadersText("");
         return;
       }
 
@@ -1405,6 +1829,7 @@ export default function Accounts() {
       showToast(t("accounts.addSuccess"));
       setShowAdd(false);
       setAddForm({ refresh_token: "", session_token: "", proxy_url: "" });
+      setAddCustomHeadersText("");
       void reload();
     } catch (error) {
       showToast(
@@ -1418,13 +1843,25 @@ export default function Accounts() {
 
   const handleAddAT = async () => {
     if (!atForm.access_token.trim()) return;
+    const parsedCustomHeaders = parseCustomHeadersText(addCustomHeadersText);
+    if (!parsedCustomHeaders.ok) {
+      showToast("自定义请求头必须是 JSON 对象，且所有值必须是字符串", "error");
+      return;
+    }
     setSubmitting(true);
     try {
-      await api.addATAccount(atForm);
-      showToast(t("accounts.addSuccess"));
+      // 始终走流式：即使只添加一个 access_token 也展示进度条，并能反映
+      // 身份去重/合并结果（已有账号更新、重复跳过）。
+      const res = await postAdminSSE("/accounts/at?stream=true", {
+        ...atForm,
+        allow_duplicate: allowDuplicate,
+        custom_headers: parsedCustomHeaders.value,
+      });
       setShowAdd(false);
+      await readImportSSE(res);
+      showToast(t("accounts.addSuccess"));
       setAtForm({ access_token: "", proxy_url: "" });
-      void reload();
+      setAddCustomHeadersText("");
     } catch (error) {
       showToast(
         t("accounts.addFailed", { error: getErrorMessage(error) }),
@@ -1499,12 +1936,59 @@ export default function Accounts() {
     }
   };
 
+  const handleAddSession = async () => {
+    if (!sessionJson.trim() || importing) return;
+    setSubmitting(true);
+    try {
+      // 解析 session JSON，构造为文件导入
+      const trimmed = sessionJson.trim();
+      const parsed = JSON.parse(trimmed) as Record<string, unknown>;
+      // 支持单个对象或数组
+      const items = Array.isArray(parsed) ? parsed : [parsed];
+      const blob = new Blob([JSON.stringify(items)], { type: "application/json" });
+      const file = new File([blob], "session.json", { type: "application/json" });
+      await importFiles([file], "json", sessionProxyUrl, addCustomHeadersText);
+      setShowAdd(false);
+      setSessionJson("");
+      setAddCustomHeadersText("");
+    } catch (error) {
+      if (error instanceof SyntaxError) {
+        showToast(t("accounts.sessionJsonInvalid"), "error");
+      } else {
+        showToast(
+          t("accounts.addFailed", { error: getErrorMessage(error) }),
+          "error",
+        );
+      }
+    } finally {
+      setSubmitting(false);
+    }
+  };
   const handleAddOpenAIResponses = async () => {
     const models = openAIForm.models;
     if (!openAIForm.api_key.trim() || models.length === 0) return;
+    const parsedCustomHeaders = parseCustomHeadersText(addCustomHeadersText);
+    if (!parsedCustomHeaders.ok) {
+      showToast("自定义请求头必须是 JSON 对象，且所有值必须是字符串", "error");
+      return;
+    }
+    const parsedModelMapping = resolveModelMappingValue(
+      openAIModelMappingMode,
+      openAIModelMappingText,
+      openAIModelMappingEntries,
+    );
+    if (!parsedModelMapping.ok) {
+      showToast("单渠道模型映射必须成对填写；JSON 模式必须是字符串对象，源模型不能重复", "error");
+      return;
+    }
     setSubmitting(true);
     try {
-      await api.addOpenAIResponsesAccount({ ...openAIForm, models });
+      await api.addOpenAIResponsesAccount({
+        ...openAIForm,
+        models,
+        model_mapping: parsedModelMapping.value,
+        custom_headers: parsedCustomHeaders.value,
+      });
       showToast(t("accounts.addSuccess"));
       setShowAdd(false);
       setOpenAIForm({
@@ -1514,6 +1998,10 @@ export default function Accounts() {
         proxy_url: "",
       });
       setOpenAIModelDraft("");
+      setOpenAIModelMappingText("");
+      setOpenAIModelMappingMode("form");
+      setOpenAIModelMappingEntries(emptyModelMappingEntries());
+      setAddCustomHeadersText("");
       void reload();
     } catch (error) {
       showToast(
@@ -1562,11 +2050,27 @@ export default function Accounts() {
       showToast(t("accounts.openaiAccountInvalid"), "error");
       return;
     }
+    const parsedCustomHeaders = parseCustomHeadersText(editCustomHeadersText);
+    if (!parsedCustomHeaders.ok) {
+      showToast("自定义请求头必须是 JSON 对象，且所有值必须是字符串", "error");
+      return;
+    }
+    const parsedModelMapping = resolveModelMappingValue(
+      editOpenAIModelMappingMode,
+      editOpenAIModelMappingText,
+      editOpenAIModelMappingEntries,
+    );
+    if (!parsedModelMapping.ok) {
+      showToast("单渠道模型映射必须成对填写；JSON 模式必须是字符串对象，源模型不能重复", "error");
+      return;
+    }
     setEditSubmitting(true);
     try {
       await api.updateOpenAIResponsesAccount(editingAccount.id, {
         ...editOpenAIForm,
         api_key: editOpenAIForm.api_key?.trim() || undefined,
+        model_mapping: parsedModelMapping.value,
+        custom_headers: parsedCustomHeaders.value,
       });
       showToast(t("accounts.openaiAccountSaveSuccess"));
       await reload();
@@ -1659,6 +2163,7 @@ export default function Accounts() {
       setOauthSession(null);
       setOauthCallbackUrl("");
       setOauthName("");
+      setAddCustomHeadersText("");
       void reload();
     } catch (error) {
       showToast(
@@ -1766,6 +2271,7 @@ export default function Accounts() {
       current: 0,
       total: 0,
       success: 0,
+      updated: 0,
       duplicate: 0,
       failed: 0,
       done: false,
@@ -1791,6 +2297,7 @@ export default function Accounts() {
             current: number;
             total: number;
             success: number;
+            updated: number;
             duplicate: number;
             failed: number;
           };
@@ -1799,6 +2306,7 @@ export default function Accounts() {
             current: event.current,
             total: event.total,
             success: event.success,
+            updated: event.updated ?? 0,
             duplicate: event.duplicate,
             failed: event.failed,
             done: event.type === "complete",
@@ -1814,13 +2322,21 @@ export default function Accounts() {
   const importFiles = async (
     files: File[],
     format: "txt" | "json" | "json_at" | "at_txt",
+    proxyOverride?: string,
+    customHeadersText?: string,
   ) => {
+    const parsedCustomHeaders = parseCustomHeadersText(customHeadersText ?? "");
+    if (!parsedCustomHeaders.ok) {
+      showToast("自定义请求头必须是 JSON 对象，且所有值必须是字符串", "error");
+      return;
+    }
     setImporting(true);
     setImportProgress({
       show: true,
       current: 0,
       total: 0,
       success: 0,
+      updated: 0,
       duplicate: 0,
       failed: 0,
       done: false,
@@ -1828,6 +2344,15 @@ export default function Accounts() {
     try {
       const formData = new FormData();
       if (format !== "txt") formData.append("format", format);
+      const trimmedImportProxy = (proxyOverride ?? importProxyUrl).trim();
+      if (trimmedImportProxy) formData.append("proxy_url", trimmedImportProxy);
+      if (parsedCustomHeaders.value) {
+        formData.append(
+          "custom_headers",
+          JSON.stringify(parsedCustomHeaders.value),
+        );
+      }
+      if (allowDuplicate) formData.append("allow_duplicate", "true");
       for (const f of files) formData.append("file", f);
       const res = await fetch("/api/admin/accounts/import", {
         method: "POST",
@@ -1852,6 +2377,7 @@ export default function Accounts() {
             current: data.total ?? 0,
             total: data.total ?? 0,
             success: data.success ?? 0,
+            updated: data.updated ?? 0,
             duplicate: data.duplicate ?? 0,
             failed: data.failed ?? 0,
             done: true,
@@ -1866,6 +2392,7 @@ export default function Accounts() {
         current: 1,
         total: 1,
         success: 0,
+        updated: 0,
         duplicate: 0,
         failed: 1,
         done: true,
@@ -2018,7 +2545,7 @@ export default function Accounts() {
       return;
     }
     setShowImportPicker(false);
-    await importFiles(files, "txt");
+    await importFiles(files, "txt", undefined, importCustomHeadersText);
     if (fileInputRef.current) fileInputRef.current.value = "";
   };
 
@@ -2026,7 +2553,12 @@ export default function Accounts() {
     const files = event.target.files;
     if (!files || files.length === 0) return;
     setShowImportPicker(false);
-    await importFiles(Array.from(files), "json");
+    await importFiles(
+      Array.from(files),
+      "json",
+      undefined,
+      importCustomHeadersText,
+    );
     if (jsonInputRef.current) jsonInputRef.current.value = "";
   };
 
@@ -2034,7 +2566,12 @@ export default function Accounts() {
     const files = event.target.files;
     if (!files || files.length === 0) return;
     setShowImportPicker(false);
-    await importFiles(Array.from(files), "json_at");
+    await importFiles(
+      Array.from(files),
+      "json_at",
+      undefined,
+      importCustomHeadersText,
+    );
     if (jsonAtInputRef.current) jsonAtInputRef.current.value = "";
   };
 
@@ -2046,7 +2583,7 @@ export default function Accounts() {
       return;
     }
     setShowImportPicker(false);
-    await importFiles(files, "at_txt");
+    await importFiles(files, "at_txt", undefined, importCustomHeadersText);
     if (atFileInputRef.current) atFileInputRef.current.value = "";
   };
 
@@ -2074,13 +2611,31 @@ export default function Accounts() {
     );
 
     if (jsonFiles.length > 0) {
-      await importFiles(jsonFiles, "json");
+      await importFiles(jsonFiles, "json", undefined, importCustomHeadersText);
     }
     if (txtFiles.length > 0) {
-      await importFiles(txtFiles, "txt");
+      await importFiles(txtFiles, "txt", undefined, importCustomHeadersText);
     }
 
     if (folderInputRef.current) folderInputRef.current.value = "";
+  };
+
+  const handlePasteImport = async () => {
+    if (!pasteImportText.trim() || importing) return;
+    const trimmed = pasteImportText.trim();
+    let items: unknown[];
+    try {
+      const parsed = JSON.parse(trimmed);
+      items = Array.isArray(parsed) ? parsed : [parsed];
+    } catch {
+      showToast(t("accounts.sessionJsonInvalid"), "error");
+      return;
+    }
+    const blob = new Blob([JSON.stringify(items)], { type: "application/json" });
+    const file = new File([blob], "paste.json", { type: "application/json" });
+    await importFiles([file], "json", undefined, importCustomHeadersText);
+    setShowPasteImport(false);
+    setPasteImportText("");
   };
 
   const handleExport = async (
@@ -2712,10 +3267,14 @@ export default function Accounts() {
     );
     setEditAutoPause5hDisabled(account.auto_pause_5h_disabled ?? false);
     setEditAutoPause7dDisabled(account.auto_pause_7d_disabled ?? false);
+    setEditDispatchCountLimitInput(
+      formatDispatchCountLimitInput(account.dispatch_count_limit),
+    );
     setAllowedAPIKeySelection(
       filterExistingAPIKeyIDs(account.allowed_api_key_ids ?? [], apiKeys),
     );
     setEditProxyUrl(account.proxy_url ?? "");
+    setEditCustomHeadersText(formatCustomHeadersText(account.custom_headers));
     setEditTags(account.tags ?? []);
     setEditGroupIds(account.group_ids ?? []);
     setEditOpenAIForm({
@@ -2726,6 +3285,14 @@ export default function Accounts() {
       proxy_url: account.proxy_url ?? "",
     });
     setEditOpenAIModelDraft("");
+    setEditOpenAIModelMappingText(account.model_mapping ?? "");
+    setEditOpenAIModelMappingMode("form");
+    {
+      const parsedMapping = parseModelMappingEntries(account.model_mapping ?? "");
+      setEditOpenAIModelMappingEntries(
+        parsedMapping.ok ? parsedMapping.entries : emptyModelMappingEntries(),
+      );
+    }
     setEditOAuthStep("generate");
     setEditOAuthSession(null);
     setEditOAuthProxyUrl(account.proxy_url ?? "");
@@ -2747,8 +3314,10 @@ export default function Accounts() {
     setEditAutoPause7dThresholdInput("");
     setEditAutoPause5hDisabled(false);
     setEditAutoPause7dDisabled(false);
+    setEditDispatchCountLimitInput("");
     setAllowedAPIKeySelection([]);
     setEditProxyUrl("");
+    setEditCustomHeadersText("");
     setEditTags([]);
     setEditGroupIds([]);
     setEditOpenAIForm({
@@ -2759,6 +3328,9 @@ export default function Accounts() {
       proxy_url: "",
     });
     setEditOpenAIModelDraft("");
+    setEditOpenAIModelMappingText("");
+    setEditOpenAIModelMappingMode("form");
+    setEditOpenAIModelMappingEntries(emptyModelMappingEntries());
     setEditOAuthStep("generate");
     setEditOAuthSession(null);
     setEditOAuthProxyUrl("");
@@ -2787,6 +3359,17 @@ export default function Accounts() {
   const editAutoPause7dThresholdInvalid = isPercentThresholdInputInvalid(
     editAutoPause7dThresholdInput,
   );
+  const editDispatchCountLimitInvalid = isDispatchCountLimitInputInvalid(
+    editDispatchCountLimitInput,
+  );
+  const editDispatchCountLimitPreview =
+    editDispatchCountLimitInvalid
+      ? null
+      : dispatchCountLimitInputToValue(editDispatchCountLimitInput);
+  const editDispatchCountResetTime =
+    editDispatchCountLimitPreview && editingAccount
+      ? formatResetAt(editingAccount.dispatch_count_reset_at)
+      : null;
   const batchAutoPause5hThresholdInvalid = isPercentThresholdInputInvalid(
     batchAutoPause5hThresholdInput,
   );
@@ -2844,9 +3427,15 @@ export default function Accounts() {
       scoreInputInvalid ||
       concurrencyInputInvalid ||
       editAutoPause5hThresholdInvalid ||
-      editAutoPause7dThresholdInvalid
+      editAutoPause7dThresholdInvalid ||
+      editDispatchCountLimitInvalid
     ) {
       showToast(t("accounts.schedulerInvalidInput"), "error");
+      return;
+    }
+    const parsedCustomHeaders = parseCustomHeadersText(editCustomHeadersText);
+    if (!parsedCustomHeaders.ok) {
+      showToast("自定义请求头必须是 JSON 对象，且所有值必须是字符串", "error");
       return;
     }
 
@@ -2869,6 +3458,10 @@ export default function Accounts() {
         ),
         auto_pause_5h_disabled: editAutoPause5hDisabled,
         auto_pause_7d_disabled: editAutoPause7dDisabled,
+        dispatch_count_limit: dispatchCountLimitInputToValue(
+          editDispatchCountLimitInput,
+        ),
+        custom_headers: parsedCustomHeaders.value,
       };
       await api.updateAccountScheduler(editingAccount.id, payload);
       showToast(t("accounts.schedulerSaveSuccess"));
@@ -3411,7 +4004,9 @@ export default function Accounts() {
               />
             </div>
             <div className="flex shrink-0 items-center gap-1 rounded-lg border border-border bg-muted/30 p-0.5 max-sm:w-full max-sm:flex-wrap">
-              {(["all", "pro", "prolite", "plus", "team", "free"] as const).map(
+              {(
+                ["all", "pro", "prolite", "plus", "team", "k12", "free"] as const
+              ).map(
                 (key) => (
                   <button
                     key={key}
@@ -3429,7 +4024,9 @@ export default function Accounts() {
                       ? t("accounts.filterAll")
                       : key === "prolite"
                         ? "ProLite"
-                        : key.charAt(0).toUpperCase() + key.slice(1)}
+                        : key === "k12"
+                          ? "K12"
+                          : key.charAt(0).toUpperCase() + key.slice(1)}
                   </button>
                 ),
               )}
@@ -4337,6 +4934,7 @@ export default function Accounts() {
             contentClassName="sm:max-w-[780px]"
             onClose={() => {
               setShowAdd(false);
+              setAllowDuplicate(false);
               setAddMethod("oauth");
               setOauthStep("generate");
               setOauthSession(null);
@@ -4349,13 +4947,34 @@ export default function Accounts() {
                 proxy_url: "",
               });
               setOpenAIModelDraft("");
+              setOpenAIModelMappingText("");
+              setOpenAIModelMappingMode("form");
+              setOpenAIModelMappingEntries(emptyModelMappingEntries());
+              setSessionJson("");
+              setSessionProxyUrl("");
+              setAddCustomHeadersText("");
             }}
             footer={
               <>
+                {(addMethod === "rt" ||
+                  addMethod === "st" ||
+                  addMethod === "at" ||
+                  addMethod === "session") && (
+                  <label className="mr-auto flex cursor-pointer items-center gap-2 text-xs text-muted-foreground">
+                    <input
+                      type="checkbox"
+                      className="size-3.5"
+                      checked={allowDuplicate}
+                      onChange={(e) => setAllowDuplicate(e.target.checked)}
+                    />
+                    {t("accounts.allowDuplicate")}
+                  </label>
+                )}
                 <Button
                   variant="outline"
                   onClick={() => {
                     setShowAdd(false);
+                    setAllowDuplicate(false);
                     setAddMethod("oauth");
                     setOauthStep("generate");
                     setOauthSession(null);
@@ -4368,6 +4987,12 @@ export default function Accounts() {
                       proxy_url: "",
                     });
                     setOpenAIModelDraft("");
+                    setOpenAIModelMappingText("");
+                    setOpenAIModelMappingMode("form");
+                    setOpenAIModelMappingEntries(emptyModelMappingEntries());
+                    setSessionJson("");
+                    setSessionProxyUrl("");
+                    setAddCustomHeadersText("");
                   }}
                 >
                   {t("common.cancel")}
@@ -4390,6 +5015,13 @@ export default function Accounts() {
                   <Button
                     onClick={() => void handleAddAT()}
                     disabled={submitting || !atForm.access_token.trim()}
+                  >
+                    {submitting ? t("accounts.adding") : t("accounts.submit")}
+                  </Button>
+                ) : addMethod === "session" ? (
+                  <Button
+                    onClick={() => void handleAddSession()}
+                    disabled={importing || submitting || !sessionJson.trim()}
                   >
                     {submitting ? t("accounts.adding") : t("accounts.submit")}
                   </Button>
@@ -4427,7 +5059,7 @@ export default function Accounts() {
             }
           >
             {/* Tab switcher */}
-            <div className="grid grid-cols-2 sm:grid-cols-5 gap-1 p-1 mb-5 rounded-xl bg-muted/50 border border-border">
+            <div className="grid grid-cols-3 sm:grid-cols-6 gap-1 p-1 mb-5 rounded-xl bg-muted/50 border border-border">
               <button
                 onClick={() => {
                   setAddMethod("oauth");
@@ -4478,6 +5110,17 @@ export default function Accounts() {
                 {t("accounts.addMethodAT")}
               </button>
               <button
+                onClick={() => setAddMethod("session")}
+                className={`min-w-0 flex-1 flex items-center justify-center gap-1.5 rounded-lg px-2 py-2 text-sm font-semibold whitespace-nowrap transition-all ${
+                  addMethod === "session"
+                    ? "bg-background shadow-sm text-foreground"
+                    : "text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                <ExternalLink className="size-3.5" />
+                {t("accounts.addMethodSession")}
+              </button>
+              <button
                 onClick={() => setAddMethod("openai")}
                 className={`min-w-0 flex-1 flex items-center justify-center gap-1.5 rounded-lg px-2 py-2 text-sm font-semibold whitespace-nowrap transition-all ${
                   addMethod === "openai"
@@ -4518,6 +5161,10 @@ export default function Accounts() {
                       proxy_url: value,
                     })),
                 })}
+                {renderCustomHeadersTextarea({
+                  value: addCustomHeadersText,
+                  onChange: setAddCustomHeadersText,
+                })}
               </div>
             ) : addMethod === "st" ? (
               <div className="space-y-4">
@@ -4546,6 +5193,10 @@ export default function Accounts() {
                       ...form,
                       proxy_url: value,
                     })),
+                })}
+                {renderCustomHeadersTextarea({
+                  value: addCustomHeadersText,
+                  onChange: setAddCustomHeadersText,
                 })}
               </div>
             ) : addMethod === "at" ? (
@@ -4578,6 +5229,40 @@ export default function Accounts() {
                       ...form,
                       proxy_url: value,
                     })),
+                })}
+                {renderCustomHeadersTextarea({
+                  value: addCustomHeadersText,
+                  onChange: setAddCustomHeadersText,
+                })}
+              </div>
+            ) : addMethod === "session" ? (
+              <div className="space-y-4">
+                <div className="rounded-xl border border-teal-200 bg-teal-50 px-4 py-3 text-sm text-teal-800 dark:border-teal-800 dark:bg-teal-950/50 dark:text-teal-300">
+                  {t("accounts.sessionHint")}
+                </div>
+                <div>
+                  <label className="block mb-2 text-sm font-semibold text-muted-foreground">
+                    {t("accounts.sessionJsonLabel")} *
+                  </label>
+                  <textarea
+                    className="w-full min-h-[260px] p-3 border border-input rounded-xl bg-background text-sm resize-y font-mono focus:outline-none focus:ring-2 focus:ring-ring"
+                    placeholder={t("accounts.sessionJsonPlaceholder")}
+                    value={sessionJson}
+                    onChange={(event: ChangeEvent<HTMLTextAreaElement>) =>
+                      setSessionJson(event.target.value)
+                    }
+                    rows={10}
+                  />
+                </div>
+                {renderProxyInput({
+                  value: sessionProxyUrl,
+                  testKey: "add-session-json",
+                  label: t("accounts.importProxyLabel"),
+                  onChange: setSessionProxyUrl,
+                })}
+                {renderCustomHeadersTextarea({
+                  value: addCustomHeadersText,
+                  onChange: setAddCustomHeadersText,
                 })}
               </div>
             ) : addMethod === "openai" ? (
@@ -4698,6 +5383,14 @@ export default function Accounts() {
                     })}
                   </p>
                 </div>
+                {renderModelMappingEditor({
+                  value: openAIModelMappingText,
+                  onChange: setOpenAIModelMappingText,
+                  mode: openAIModelMappingMode,
+                  onModeChange: setOpenAIModelMappingMode,
+                  entries: openAIModelMappingEntries,
+                  onEntriesChange: setOpenAIModelMappingEntries,
+                })}
                 {renderProxyInput({
                   value: openAIForm.proxy_url,
                   testKey: "add-openai-responses",
@@ -4706,6 +5399,10 @@ export default function Accounts() {
                       ...form,
                       proxy_url: value,
                     })),
+                })}
+                {renderCustomHeadersTextarea({
+                  value: addCustomHeadersText,
+                  onChange: setAddCustomHeadersText,
                 })}
               </div>
             ) : (
@@ -4811,8 +5508,36 @@ export default function Accounts() {
             show={showImportPicker}
             title={t("accounts.importTitle")}
             contentClassName="sm:max-w-[640px]"
-            onClose={() => setShowImportPicker(false)}
+            onClose={() => {
+              setShowImportPicker(false);
+              setShowPasteImport(false);
+              setPasteImportText('');
+            }}
           >
+            <div className="mb-4 space-y-1.5">
+              {renderProxyInput({
+                value: importProxyUrl,
+                testKey: "import-batch",
+                label: t("accounts.importProxyLabel"),
+                onChange: setImportProxyUrl,
+              })}
+              <p className="text-[11px] text-muted-foreground">
+                {t("accounts.importProxyHint")}
+              </p>
+              {renderCustomHeadersTextarea({
+                value: importCustomHeadersText,
+                onChange: setImportCustomHeadersText,
+              })}
+              <label className="flex cursor-pointer items-center gap-2 pt-1 text-xs text-muted-foreground">
+                <input
+                  type="checkbox"
+                  className="size-3.5"
+                  checked={allowDuplicate}
+                  onChange={(e) => setAllowDuplicate(e.target.checked)}
+                />
+                {t("accounts.allowDuplicate")}
+              </label>
+            </div>
             <div className="grid grid-cols-2 gap-3">
               <button
                 className="flex items-center gap-3 rounded-xl border border-border px-4 py-3 text-left hover:bg-muted/50 transition-colors"
@@ -4899,7 +5624,53 @@ export default function Accounts() {
                   </div>
                 </div>
               </button>
+              <button
+                className="flex items-center gap-3 rounded-xl border border-border px-4 py-3 text-left hover:bg-muted/50 transition-colors"
+                onClick={() => {
+                  setShowPasteImport(true);
+                  setPasteImportText("");
+                }}
+              >
+                <Copy className="size-5 shrink-0 text-muted-foreground" />
+                <div>
+                  <div className="text-sm font-medium">
+                    {t("accounts.importPasteText")}
+                  </div>
+                  <div className="text-[11px] text-muted-foreground">
+                    {t("accounts.importPasteTextDesc")}
+                  </div>
+                </div>
+              </button>
             </div>
+
+            {showPasteImport && (
+              <div className="mt-4 space-y-3">
+                <textarea
+                  className="w-full min-h-[240px] p-3 border border-input rounded-xl bg-background text-sm resize-y font-mono focus:outline-none focus:ring-2 focus:ring-ring"
+                  placeholder={t("accounts.sessionJsonPlaceholder")}
+                  value={pasteImportText}
+                  onChange={(e) => setPasteImportText(e.target.value)}
+                  rows={10}
+                />
+                <div className="flex justify-end gap-2">
+                  <Button
+                    variant="outline"
+                    onClick={() => {
+                      setShowPasteImport(false);
+                      setPasteImportText("");
+                    }}
+                  >
+                    {t("common.cancel")}
+                  </Button>
+                  <Button
+                    onClick={() => void handlePasteImport()}
+                    disabled={importing || !pasteImportText.trim()}
+                  >
+                    {t("accounts.submit")}
+                  </Button>
+                </div>
+              </div>
+            )}
           </Modal>
           <Sub2APIImportModal
             show={showSub2APIImport}
@@ -5177,7 +5948,8 @@ export default function Accounts() {
                         (scoreInputInvalid ||
                           concurrencyInputInvalid ||
                           editAutoPause5hThresholdInvalid ||
-                          editAutoPause7dThresholdInvalid)) ||
+                          editAutoPause7dThresholdInvalid ||
+                          editDispatchCountLimitInvalid)) ||
                       openAIAccountInputInvalid
                     }
                   >
@@ -5341,6 +6113,14 @@ export default function Accounts() {
                         })}
                       </p>
                     </div>
+                    {renderModelMappingEditor({
+                      value: editOpenAIModelMappingText,
+                      onChange: setEditOpenAIModelMappingText,
+                      mode: editOpenAIModelMappingMode,
+                      onModeChange: setEditOpenAIModelMappingMode,
+                      entries: editOpenAIModelMappingEntries,
+                      onEntriesChange: setEditOpenAIModelMappingEntries,
+                    })}
                     {renderProxyInput({
                       value: editOpenAIForm.proxy_url,
                       testKey: "edit-openai-responses",
@@ -5349,6 +6129,10 @@ export default function Accounts() {
                           ...form,
                           proxy_url: value,
                         })),
+                    })}
+                    {renderCustomHeadersTextarea({
+                      value: editCustomHeadersText,
+                      onChange: setEditCustomHeadersText,
                     })}
                   </div>
                 ) : editTab === "account" && isOAuthAccount(editingAccount) ? (
@@ -5557,10 +6341,9 @@ export default function Accounts() {
                                         editingAccount,
                                       ),
                                   })}
-                              </div>
                             </div>
-                          )}
-                        </div>
+                          </div>
+                        )}
                       </div>
 
                       <div className="rounded-xl border border-border p-4">
@@ -5587,6 +6370,53 @@ export default function Accounts() {
                               className={`pointer-events-none block size-4 rounded-full bg-white shadow transition-transform ${skipWarmTier ? "translate-x-4" : "translate-x-0"}`}
                             />
                           </button>
+                        </div>
+                      </div>
+
+                      <div className="rounded-xl border border-border p-4 md:col-span-2">
+                        <div className="text-sm font-semibold text-foreground">
+                          {t("accounts.dispatchCountLimitTitle")}
+                        </div>
+                        <div className="mt-1 text-xs text-muted-foreground">
+                          {t("accounts.dispatchCountLimitHint")}
+                        </div>
+                        <div className="mt-3">
+                          <label className="mb-1.5 block text-xs font-semibold text-muted-foreground">
+                            {t("accounts.dispatchCountLimitLabel")}
+                          </label>
+                          <Input
+                            inputMode="numeric"
+                            value={editDispatchCountLimitInput}
+                            placeholder={t(
+                              "accounts.dispatchCountLimitPlaceholder",
+                            )}
+                            onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                              setEditDispatchCountLimitInput(event.target.value)
+                            }
+                          />
+                          <div
+                            className={`mt-1.5 text-xs ${editDispatchCountLimitInvalid ? "text-red-500" : "text-muted-foreground"}`}
+                          >
+                            {editDispatchCountLimitInvalid
+                              ? t("accounts.dispatchCountLimitRange")
+                              : editDispatchCountLimitPreview
+                                ? t("accounts.dispatchCountLimitStatus", {
+                                    used:
+                                      editingAccount.dispatch_count_used ?? 0,
+                                    limit: editDispatchCountLimitPreview,
+                                  })
+                                : t("accounts.dispatchCountLimitDisabled")}
+                          </div>
+                          {editDispatchCountResetTime ? (
+                            <div
+                              className="mt-1 text-xs text-muted-foreground"
+                              title={editDispatchCountResetTime.title}
+                            >
+                              {t("accounts.dispatchCountLimitResetAt", {
+                                time: editDispatchCountResetTime.label,
+                              })}
+                            </div>
+                          ) : null}
                         </div>
                       </div>
 
@@ -5642,32 +6472,40 @@ export default function Accounts() {
                         <div className="mt-1 text-xs text-muted-foreground">
                           {t("accounts.allowedAPIKeysHint")}
                         </div>
-                          <div className="mt-3">
-                            <APIKeyMultiSelect
-                              options={apiKeys}
-                              value={allowedAPIKeySelection}
-                              disabled={apiKeys.length === 0}
-                              onChange={setAllowedAPIKeySelection}
-                              allLabel={t("accounts.allowedAPIKeysAll")}
-                              selectedLabel={t(
-                                "accounts.allowedAPIKeysSelected",
-                                {
-                                  count: allowedAPIKeySelection.length,
-                                },
-                              )}
-                              placeholder={t("accounts.allowedAPIKeysPlaceholder")}
-                              emptyLabel={t("accounts.allowedAPIKeysNoOptions")}
-                              emptyHint={t("accounts.allowedAPIKeysNoOptionsHint")}
-                            />
-                          </div>
-                    </div>
+                        <div className="mt-3">
+                          <APIKeyMultiSelect
+                            options={apiKeys}
+                            value={allowedAPIKeySelection}
+                            disabled={apiKeys.length === 0}
+                            onChange={setAllowedAPIKeySelection}
+                            allLabel={t("accounts.allowedAPIKeysAll")}
+                            selectedLabel={t(
+                              "accounts.allowedAPIKeysSelected",
+                              {
+                                count: allowedAPIKeySelection.length,
+                              },
+                            )}
+                            placeholder={t("accounts.allowedAPIKeysPlaceholder")}
+                            emptyLabel={t("accounts.allowedAPIKeysNoOptions")}
+                            emptyHint={t("accounts.allowedAPIKeysNoOptionsHint")}
+                          />
+                        </div>
+                      </div>
 
-                    <div className="rounded-xl border border-border p-4">
-                      {renderProxyInput({
-                        value: editProxyUrl,
-                        testKey: "edit-account-proxy",
-                        onChange: setEditProxyUrl,
-                      })}
+                      <div className="rounded-xl border border-border p-4">
+                        {renderProxyInput({
+                          value: editProxyUrl,
+                          testKey: "edit-account-proxy",
+                          onChange: setEditProxyUrl,
+                        })}
+                      </div>
+
+                      <div className="rounded-xl border border-border p-4 md:col-span-2">
+                        {renderCustomHeadersTextarea({
+                          value: editCustomHeadersText,
+                          onChange: setEditCustomHeadersText,
+                        })}
+                      </div>
                     </div>
 
                     <div className="grid gap-4 md:grid-cols-2">
@@ -6181,8 +7019,8 @@ export default function Accounts() {
                   ? `${importProgress.current} / ${importProgress.total}  (${Math.round((importProgress.current / importProgress.total) * 100)}%)`
                   : t("accounts.importPreparing")}
               </div>
-              <div className="grid grid-cols-3 gap-3 text-center">
-                <div className="rounded-xl bg-emerald-500/10 px-3 py-2">
+              <div className="grid grid-cols-4 gap-2 text-center">
+                <div className="rounded-xl bg-emerald-500/10 px-2 py-2">
                   <div className="text-lg font-bold text-emerald-600">
                     {importProgress.success}
                   </div>
@@ -6190,7 +7028,15 @@ export default function Accounts() {
                     {t("accounts.importSuccess")}
                   </div>
                 </div>
-                <div className="rounded-xl bg-amber-500/10 px-3 py-2">
+                <div className="rounded-xl bg-sky-500/10 px-2 py-2">
+                  <div className="text-lg font-bold text-sky-600">
+                    {importProgress.updated}
+                  </div>
+                  <div className="text-[11px] text-muted-foreground">
+                    {t("accounts.importUpdated")}
+                  </div>
+                </div>
+                <div className="rounded-xl bg-amber-500/10 px-2 py-2">
                   <div className="text-lg font-bold text-amber-600">
                     {importProgress.duplicate}
                   </div>
@@ -6198,7 +7044,7 @@ export default function Accounts() {
                     {t("accounts.importDuplicate")}
                   </div>
                 </div>
-                <div className="rounded-xl bg-red-500/10 px-3 py-2">
+                <div className="rounded-xl bg-red-500/10 px-2 py-2">
                   <div className="text-lg font-bold text-red-600">
                     {importProgress.failed}
                   </div>
@@ -7410,10 +8256,19 @@ function isActiveAutoPauseWindowReached(
   return value / 100 >= threshold;
 }
 
+// Plans that carry a rolling 5h usage window (mirrors Go isPremium5hPlan).
+// k12/edu are paid education workspaces with 5h limits (issue #307/#309).
 function isPremiumUsagePlan(planType?: string): boolean {
-  return ["plus", "pro", "team", "teamplus"].includes(
-    normalizePlanType(planType),
-  );
+  return [
+    "plus",
+    "pro",
+    "team",
+    "teamplus",
+    "k12",
+    "edu",
+    "education",
+    "go",
+  ].includes(normalizePlanType(planType));
 }
 
 type RateLimitWindow = "5h" | "7d";
@@ -7427,8 +8282,15 @@ function isUnsampledQuotaAccount(account: AccountRow): boolean {
   if (status === "unauthorized" || account.openai_responses_api) {
     return false;
   }
-  const value = account.usage_percent_7d;
-  return typeof value !== "number" || !Number.isFinite(value);
+  // k12 等 team 型工作区可能只返回 5h 窗口：任一窗口有数据即算已采样，
+  // 否则这类账号会永远显示"未采样" (issue #282)。
+  const has7d =
+    typeof account.usage_percent_7d === "number" &&
+    Number.isFinite(account.usage_percent_7d);
+  const has5h =
+    typeof account.usage_percent_5h === "number" &&
+    Number.isFinite(account.usage_percent_5h);
+  return !has7d && !has5h;
 }
 
 function getAccountRateLimitWindow(
@@ -7529,6 +8391,8 @@ function isSubscriptionPlan(planType?: string): boolean {
       "business",
       "edu",
       "education",
+      "k12",
+      "go",
     ].includes(normalized)
   ) {
     return true;
@@ -7824,6 +8688,7 @@ function PlanBadge({ planType }: { planType?: string }) {
       "bg-purple-50 text-purple-600 ring-purple-400/25 dark:bg-purple-500/15 dark:text-purple-300 dark:ring-purple-400/25",
     plus: "bg-blue-100 text-blue-700 ring-blue-500/30 dark:bg-blue-500/20 dark:text-blue-300 dark:ring-blue-400/30",
     team: "bg-amber-100 text-amber-700 ring-amber-500/30 dark:bg-amber-500/20 dark:text-amber-300 dark:ring-amber-400/30",
+    k12: "bg-emerald-100 text-emerald-700 ring-emerald-500/30 dark:bg-emerald-500/20 dark:text-emerald-300 dark:ring-emerald-400/30",
     free: "bg-zinc-100 text-zinc-500 ring-zinc-400/20 dark:bg-zinc-500/10 dark:text-zinc-400 dark:ring-zinc-400/15",
   };
 
@@ -7849,6 +8714,7 @@ function getDefaultScoreBias(planType?: string): number {
     case "pro":
     case "plus":
     case "team":
+    case "k12":
       return 50;
     default:
       return 0;
@@ -9203,13 +10069,24 @@ function TestConnectionModal({
           const accountModels = (account.models ?? []).filter(
             isConnectionTestModel,
           );
+          const mappingAliases = exactModelMappingAliases(
+            account.model_mapping,
+            accountModels,
+          );
+          const testModels = uniqueTestModels(
+            [...mappingAliases, ...accountModels],
+            undefined,
+            false,
+          );
           const preferredModel =
-            accountModels.find(
+            testModels.find(
               (item) =>
                 item.toLowerCase() === settings.test_model.toLowerCase(),
-            ) ?? accountModels[0];
+            ) ??
+            mappingAliases[0] ??
+            accountModels[0];
           const nextModels = uniqueTestModels(
-            accountModels,
+            testModels,
             preferredModel,
             false,
           );
@@ -9232,8 +10109,15 @@ function TestConnectionModal({
       } catch {
         if (!active) return;
         if (isOpenAIResponsesAccount) {
+          const accountModels = (account.models ?? []).filter(
+            isConnectionTestModel,
+          );
+          const mappingAliases = exactModelMappingAliases(
+            account.model_mapping,
+            accountModels,
+          );
           const fallbackModels = uniqueTestModels(
-            (account.models ?? []).filter(isConnectionTestModel),
+            [...mappingAliases, ...accountModels],
             undefined,
             false,
           );
@@ -9256,7 +10140,7 @@ function TestConnectionModal({
     return () => {
       active = false;
     };
-  }, [account.models, isOpenAIResponsesAccount]);
+  }, [account.model_mapping, account.models, isOpenAIResponsesAccount]);
 
   useEffect(() => {
     if (!modelOptionsReady || !selectedModel) return;
@@ -9561,7 +10445,7 @@ function UsageBar({
   return (
     <div>
       <div className="flex items-center gap-1.5">
-        <span className="text-[11px] font-medium text-muted-foreground w-5 shrink-0">
+        <span className="text-[11px] font-medium text-muted-foreground w-7 shrink-0">
           {label}
         </span>
         <div className="flex-1 h-1.5 rounded-full bg-muted overflow-hidden min-w-[72px]">
@@ -9575,13 +10459,13 @@ function UsageBar({
         </span>
       </div>
       {detailText && (
-        <div className="text-[11px] font-medium text-muted-foreground mt-0.5 pl-[26px]">
+        <div className="text-[11px] font-medium text-muted-foreground mt-0.5 pl-[34px]">
           {detailText}
         </div>
       )}
       {resetTime && (
         <div
-          className="text-[11px] font-medium text-muted-foreground mt-0.5 pl-[26px]"
+          className="text-[11px] font-medium text-muted-foreground mt-0.5 pl-[34px]"
           title={resetTime.title}
         >
           ⏱ {resetTime.label}
@@ -9611,7 +10495,7 @@ function UsageWindowStat({
   return (
     <div className="flex flex-col gap-0.5">
       <div className="flex items-center gap-1.5 text-[11px] font-medium text-muted-foreground">
-        <span className="w-5 shrink-0">{label}</span>
+        <span className="w-7 shrink-0">{label}</span>
         <span>
           {formatCompactUsageNumber(detail?.requests)}{" "}
           {t("accounts.usageReqUnit")} /{" "}
@@ -9620,7 +10504,7 @@ function UsageWindowStat({
         </span>
       </div>
       {(accountBilledText || userBilledText) && (
-        <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground/80 pl-6">
+        <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground/80 pl-[34px]">
           {accountBilledText && (
             <span>
               {t("accounts.accountBilledLabel")}: ${accountBilledText}
@@ -9698,12 +10582,10 @@ function UsageCell({
 
   const fiveHourPresent = has5h || has5hDetail || has5hReset;
   const sevenDayPresent = has7d || has7dDetail || has7dReset;
+  // 长窗口标签:free/team plan 实为月窗(约 30 天),按真实周期显示 30d 而非误标 7d (issue #324)
+  const longWindowLabel = formatLongUsageWindowLabel(account);
   // plan 表明是订阅型时,即使数据暂未拉到也按订阅布局占位,避免抖动
-  const planSuggestsPremium =
-    plan === "pro" ||
-    plan === "team" ||
-    plan === "plus" ||
-    plan === "teamplus";
+  const planSuggestsPremium = isPremiumUsagePlan(plan);
   const showFiveHour = fiveHourPresent || planSuggestsPremium;
 
   if (showFiveHour) {
@@ -9724,13 +10606,13 @@ function UsageCell({
           )}
           {has7d ? (
             <UsageBar
-              label="7d"
+              label={longWindowLabel}
               pct={account.usage_percent_7d!}
               resetAt={account.reset_7d_at}
               detail={account.usage_7d_detail}
             />
           ) : (
-            <UsageWindowStat label="7d" detail={account.usage_7d_detail} />
+            <UsageWindowStat label={longWindowLabel} detail={account.usage_7d_detail} />
           )}
         </div>
         {refreshButton}
@@ -9744,13 +10626,13 @@ function UsageCell({
         <div className="flex-1">
           {has7d ? (
             <UsageBar
-              label="7d"
+              label={longWindowLabel}
               pct={account.usage_percent_7d!}
               resetAt={account.reset_7d_at}
               detail={account.usage_7d_detail}
             />
           ) : (
-            <UsageWindowStat label="7d" detail={account.usage_7d_detail} />
+            <UsageWindowStat label={longWindowLabel} detail={account.usage_7d_detail} />
           )}
         </div>
         {refreshButton}
@@ -9765,11 +10647,12 @@ function BilledCell({ account }: { account: AccountRow }) {
   const h5 = typeof account.billed_5h === "number" ? account.billed_5h.toFixed(2) : null;
   const d7 = typeof account.billed_7d === "number" ? account.billed_7d.toFixed(2) : null;
   if (h5 === null && d7 === null) return <span className="text-[12px] text-muted-foreground">-</span>;
+  const longLabel = formatLongUsageWindowLabel(account);
   return (
     <span className="text-[12px] text-muted-foreground">
       {h5 !== null ? `5h: $${h5}` : "5h: -"}
       {" / "}
-      {d7 !== null ? `7d: $${d7}` : "7d: -"}
+      {d7 !== null ? `${longLabel}: $${d7}` : `${longLabel}: -`}
     </span>
   );
 }

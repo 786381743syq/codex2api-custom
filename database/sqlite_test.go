@@ -236,6 +236,129 @@ func TestFindActiveAccountByOAuthIdentity(t *testing.T) {
 	}
 }
 
+// 个人账号 JWT 可能没有工作区 account_id，只有 user_id（user-...）；此外旧版
+// wham 回填曾把 user_id 写进 account_id 字段。身份匹配必须两个键都认，
+// 否则 AT 轮换后同一账号会被重复导入。
+func TestFindActiveAccountByOAuthIdentityMatchesUserID(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+
+	// 账号 A：credentials 里存的是 user_id 键
+	idA, err := db.InsertAccountWithCredentials(ctx, "uid-key", map[string]interface{}{
+		"access_token": "at-uid-key",
+		"email":        "solo@example.com",
+		"user_id":      "user-abc123",
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials A 返回错误: %v", err)
+	}
+	got, err := db.FindActiveAccountByOAuthIdentity(ctx, "solo@example.com", "user-abc123")
+	if err != nil {
+		t.Fatalf("match by user_id key 返回错误: %v", err)
+	}
+	if got != idA {
+		t.Fatalf("matched id = %d, want %d", got, idA)
+	}
+
+	// 账号 B：旧版 wham 回填把 user_id 污染进了 account_id 字段
+	idB, err := db.InsertAccountWithCredentials(ctx, "polluted", map[string]interface{}{
+		"access_token": "at-polluted",
+		"email":        "legacy@example.com",
+		"account_id":   "user-def456", // 实为 user_id
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials B 返回错误: %v", err)
+	}
+	got, err = db.FindActiveAccountByOAuthIdentity(ctx, "legacy@example.com", "user-def456")
+	if err != nil {
+		t.Fatalf("match polluted account_id 返回错误: %v", err)
+	}
+	if got != idB {
+		t.Fatalf("matched id = %d, want %d", got, idB)
+	}
+}
+
+// v2 迁移：user_id 也是身份别名——个人账号（credentials 只有 user_id）和被旧版
+// wham 回填污染（user_id 写进了 account_id）的账号必须合并为一组。
+// 勾选"允许重复添加"强制导入的副本（allow_duplicate 标记）不参与合并。
+func TestSQLiteDataMigrationV2DedupesByUserID(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	ctx := context.Background()
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.conn.ExecContext(ctx, `DELETE FROM data_migrations WHERE version = $1`, dataMigrationOAuthIdentityDedupeV2); err != nil {
+		t.Fatalf("清理 v2 data migration 标记返回错误: %v", err)
+	}
+
+	// 旧账号：account_id 字段被污染成 user_id（旧版 wham 回填）
+	pollutedID, err := db.InsertAccountWithCredentials(ctx, "polluted", map[string]interface{}{
+		"access_token": "at-old-rotation",
+		"email":        "solo@example.com",
+		"account_id":   "user-dup999",
+	}, "")
+	if err != nil {
+		t.Fatalf("Insert polluted 返回错误: %v", err)
+	}
+	// 新账号：正确存在 user_id 键（新导入路径）
+	freshID, err := db.InsertAccountWithCredentials(ctx, "fresh", map[string]interface{}{
+		"access_token": "at-new-rotation",
+		"email":        "solo@example.com",
+		"user_id":      "user-dup999",
+	}, "")
+	if err != nil {
+		t.Fatalf("Insert fresh 返回错误: %v", err)
+	}
+	// 强制重复副本：allow_duplicate 标记，身份与上面相同，但必须保留
+	forcedID, err := db.InsertAccountWithCredentials(ctx, "forced-dup", map[string]interface{}{
+		"access_token":    "at-forced-copy",
+		"email":           "solo@example.com",
+		"user_id":         "user-dup999",
+		"allow_duplicate": "true",
+	}, "")
+	if err != nil {
+		t.Fatalf("Insert forced 返回错误: %v", err)
+	}
+
+	if err := db.runDataMigrationsWithTimeout(); err != nil {
+		t.Fatalf("runDataMigrations 返回错误: %v", err)
+	}
+
+	var remaining int
+	if err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM accounts WHERE id IN ($1, $2) AND status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted'`, pollutedID, freshID).Scan(&remaining); err != nil {
+		t.Fatalf("查询存活账号数返回错误: %v", err)
+	}
+	if remaining != 1 {
+		t.Fatalf("v2 迁移后存活账号 = %d, want 1（user_id 重复应被合并）", remaining)
+	}
+
+	var forcedAlive int
+	if err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM accounts WHERE id = $1 AND status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted'`, forcedID).Scan(&forcedAlive); err != nil {
+		t.Fatalf("查询强制副本返回错误: %v", err)
+	}
+	if forcedAlive != 1 {
+		t.Fatal("allow_duplicate 副本被迁移误删，应保留")
+	}
+
+	// 强制副本也不作为身份判重锚点：按身份查找应命中主账号而非副本
+	if got, err := db.FindActiveAccountByOAuthIdentity(ctx, "solo@example.com", "user-dup999"); err != nil {
+		t.Fatalf("FindActiveAccountByOAuthIdentity 返回错误: %v", err)
+	} else if got == forcedID {
+		t.Fatal("身份判重不应命中 allow_duplicate 副本")
+	}
+}
+
 func TestSQLiteDataMigrationDedupesOAuthIdentityOnce(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 	ctx := context.Background()
@@ -945,6 +1068,7 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 		MaxConcurrency:                   2,
 		GlobalRPM:                        0,
 		TestModel:                        "gpt-5.4",
+		TestContent:                      "say pong",
 		TestConcurrency:                  50,
 		BackgroundRefreshIntervalMinutes: 2,
 		UsageProbeMaxAgeMinutes:          10,
@@ -972,6 +1096,7 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 		PromptFilterReviewFailClosed:     false,
 		ClientCompatMode:                 "preserve",
 		CodexMinCLIVersion:               "0.118.0",
+		CodexUserAgentConfig:             `{"terminal":"xterm-256color","os_name":"Linux","os_version":"Unknown"}`,
 		UsageLogMode:                     "full",
 		UsageLogBatchSize:                200,
 		UsageLogFlushIntervalSeconds:     5,
@@ -1003,6 +1128,9 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 	if settings.FirstTokenTimeoutSeconds != 17 {
 		t.Fatalf("FirstTokenTimeoutSeconds = %d, want 17", settings.FirstTokenTimeoutSeconds)
 	}
+	if settings.TestContent != "say pong" {
+		t.Fatalf("TestContent = %q, want say pong", settings.TestContent)
+	}
 	if settings.FirstTokenMode != "loose" {
 		t.Fatalf("FirstTokenMode = %q, want loose", settings.FirstTokenMode)
 	}
@@ -1017,6 +1145,9 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 	}
 	if settings.CodexModelMapping != `{"gpt-5.2":"gpt-5.5"}` {
 		t.Fatalf("CodexModelMapping = %q, want gpt-5.2 mapping", settings.CodexModelMapping)
+	}
+	if settings.CodexUserAgentConfig != `{"terminal":"xterm-256color","os_name":"Linux","os_version":"Unknown"}` {
+		t.Fatalf("CodexUserAgentConfig = %q, want custom UA config", settings.CodexUserAgentConfig)
 	}
 	if settings.ReasoningEffortModels != `[{"model":"gpt-5.5","effort":"xhigh"}]` {
 		t.Fatalf("ReasoningEffortModels = %q, want gpt-5.5 xhigh entry", settings.ReasoningEffortModels)
@@ -2149,6 +2280,79 @@ func TestUsageLogsFilterByAPIKeyID(t *testing.T) {
 		if usageLog.AccountID != targetAccountID {
 			t.Fatalf("AccountID = %d, want %d", usageLog.AccountID, targetAccountID)
 		}
+	}
+}
+
+func TestUsageLogsIncludeAccountNameForOpenAIResponsesAccount(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	now := time.Now().UTC()
+	accountID, err := db.InsertOpenAIResponsesAccount(ctx, "API 别名", map[string]interface{}{
+		"base_url": "https://api.example.com",
+		"email":    "https://api.example.com",
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertOpenAIResponsesAccount 返回错误: %v", err)
+	}
+	if err := db.InsertUsageLog(ctx, &UsageLogInput{
+		AccountID:  accountID,
+		Endpoint:   "/v1/responses",
+		Model:      "gpt-4.1",
+		StatusCode: 200,
+		DurationMs: 120,
+	}); err != nil {
+		t.Fatalf("InsertUsageLog 返回错误: %v", err)
+	}
+	db.flushLogs()
+
+	recentLogs, err := db.ListRecentUsageLogs(ctx, 10)
+	if err != nil {
+		t.Fatalf("ListRecentUsageLogs 返回错误: %v", err)
+	}
+	if len(recentLogs) != 1 {
+		t.Fatalf("recentLogs 长度 = %d, want 1", len(recentLogs))
+	}
+	if recentLogs[0].AccountName != "API 别名" {
+		t.Fatalf("AccountName = %q, want API 别名", recentLogs[0].AccountName)
+	}
+	if recentLogs[0].AccountEmail != "https://api.example.com" {
+		t.Fatalf("AccountEmail = %q, want base URL", recentLogs[0].AccountEmail)
+	}
+
+	page, err := db.ListUsageLogsByTimeRangePaged(ctx, UsageLogFilter{
+		Start:    now.Add(-1 * time.Hour),
+		End:      now.Add(1 * time.Hour),
+		Page:     1,
+		PageSize: 10,
+		Email:    "API 别名",
+	})
+	if err != nil {
+		t.Fatalf("ListUsageLogsByTimeRangePaged 返回错误: %v", err)
+	}
+	if page.Total != 1 || len(page.Logs) != 1 {
+		t.Fatalf("page = total %d len %d, want 1/1", page.Total, len(page.Logs))
+	}
+	if page.Logs[0].AccountName != "API 别名" {
+		t.Fatalf("paged AccountName = %q, want API 别名", page.Logs[0].AccountName)
+	}
+
+	logs, err := db.ListUsageLogsByFilter(ctx, UsageLogFilter{
+		Start: now.Add(-1 * time.Hour),
+		End:   now.Add(1 * time.Hour),
+		Query: "API 别名",
+	})
+	if err != nil {
+		t.Fatalf("ListUsageLogsByFilter 返回错误: %v", err)
+	}
+	if len(logs) != 1 || logs[0].AccountName != "API 别名" {
+		t.Fatalf("filter logs = %+v, want one account name match", logs)
 	}
 }
 
