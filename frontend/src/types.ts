@@ -1,4 +1,4 @@
-export type ToastType = 'success' | 'error'
+export type ToastType = 'success' | 'error' | 'warning' | 'info'
 export type ISODateString = string
 
 export interface ToastState {
@@ -695,10 +695,14 @@ export interface SystemSettings {
   codex_ws_hide_upstream_errors: boolean
   codex_ws_silent_retry_enabled: boolean
   codex_ws_silent_max_retries: number
+  codex_continue_thinking_enabled: boolean
+  codex_continue_max_rounds: number
   scheduler_mode: string
   affinity_mode?: string
   max_retries: number
   max_rate_limit_retries: number
+  retry_interval_ms: number
+  transport_retry_policy: string
   allow_remote_migration: boolean
   database_driver: string
   database_label: string
@@ -729,6 +733,9 @@ export interface SystemSettings {
   prompt_filter_review_fail_closed: boolean
   client_compat_mode: 'preserve' | 'auto' | 'force' | string
   codex_min_cli_version: string
+  codex_cli_version_sync_enabled: boolean
+  codex_cli_version_sync_interval_hours: number
+  codex_synced_cli_version?: string
   codex_user_agent_config: string
   usage_log_mode: 'full' | 'errors' | 'off' | string
   usage_log_batch_size: number
@@ -1129,6 +1136,7 @@ export interface APIKeyRow {
   allowed_group_ids?: number[]
   limits?: APIKeyLimits
   window_usage?: APIKeyWindowUsage
+  last_used_at?: ISODateString | null
   created_at: ISODateString
 }
 

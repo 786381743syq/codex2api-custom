@@ -2193,6 +2193,16 @@ type Store struct {
 	codexWSSilentRetryEnabled   atomic.Bool  // 首包前上游 WS 错误静默换号重试，默认开启
 	codexWSSilentMaxRetries     atomic.Int64 // WS 静默换号最大重试次数，默认 2
 
+	// Codex 思考截断自动续想（默认关闭，不影响现有路径）
+	codexContinueThinkingEnabled atomic.Bool  // 检测到上游截断思考时自动续想并折叠成单响应
+	codexContinueMaxRounds       atomic.Int64 // 单次请求最大续想轮数（含首轮），默认 8
+	codexCLIVersionSyncEnabled   atomic.Bool  // 后台定时同步 Codex CLI 模拟版本，默认 true
+	codexCLIVersionSyncInterval  atomic.Int64 // 定时同步间隔（小时），默认 12
+
+	// 重试间隔与传输错误重试策略（issue #331）
+	retryIntervalMS      atomic.Int64 // 重试间隔毫秒，0 = 立即重试（旧行为）
+	transportRetryPolicy atomic.Value // 传输错误重试策略: rotate / sticky
+
 	// 智能刷新调度器
 	refreshScheduler atomic.Pointer[RefreshSchedulerIntegration]
 
@@ -2600,6 +2610,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 			CodexWSHideUpstreamErrors:          true,
 			CodexWSSilentRetryEnabled:          true,
 			CodexWSSilentMaxRetries:            2,
+			CodexContinueMaxRounds:             8,
 			AutoPause5hGuardBandPercent:        defaultAutoPause5hGuardBandPercent,
 			AutoPause5hGuardConcurrency:        defaultAutoPause5hGuardConcurrency,
 			SmartPacingMinConcurrency:          defaultSmartPacingMinConcurrency,
@@ -2671,6 +2682,12 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.codexWSHideUpstreamErrors.Store(settings.CodexWSHideUpstreamErrors)
 	s.codexWSSilentRetryEnabled.Store(settings.CodexWSSilentRetryEnabled)
 	s.codexWSSilentMaxRetries.Store(normalizeWSSilentMaxRetries(settings.CodexWSSilentMaxRetries))
+	s.codexContinueThinkingEnabled.Store(settings.CodexContinueThinkingEnabled)
+	s.codexContinueMaxRounds.Store(int64(database.NormalizeCodexContinueMaxRounds(settings.CodexContinueMaxRounds)))
+	s.codexCLIVersionSyncEnabled.Store(settings.CodexCLIVersionSyncEnabled)
+	s.codexCLIVersionSyncInterval.Store(int64(database.NormalizeCodexCLIVersionSyncIntervalHours(settings.CodexCLIVersionSyncIntervalHours)))
+	s.retryIntervalMS.Store(int64(normalizeRetryIntervalMS(settings.RetryIntervalMS)))
+	s.transportRetryPolicy.Store(database.NormalizeTransportRetryPolicy(settings.TransportRetryPolicy))
 
 	s.globalAutoPause5hThreshold = normalizeQuotaAutoPauseThreshold(settings.AutoPause5hThreshold)
 	s.globalAutoPause7dThreshold = normalizeQuotaAutoPauseThreshold(settings.AutoPause7dThreshold)
@@ -2899,6 +2916,70 @@ func (s *Store) CodexWSSilentMaxRetries() int {
 		return 2
 	}
 	return int(s.codexWSSilentMaxRetries.Load())
+}
+
+// SetCodexContinueThinkingEnabled 设置是否在上游截断思考时自动续想。
+func (s *Store) SetCodexContinueThinkingEnabled(enabled bool) {
+	if s == nil {
+		return
+	}
+	s.codexContinueThinkingEnabled.Store(enabled)
+}
+
+// CodexContinueThinkingEnabled 返回是否在上游截断思考时自动续想。
+func (s *Store) CodexContinueThinkingEnabled() bool {
+	if s == nil {
+		return false
+	}
+	return s.codexContinueThinkingEnabled.Load()
+}
+
+// SetCodexContinueMaxRounds 设置单次请求最大续想轮数（含首轮）。
+func (s *Store) SetCodexContinueMaxRounds(rounds int) {
+	if s == nil {
+		return
+	}
+	s.codexContinueMaxRounds.Store(int64(database.NormalizeCodexContinueMaxRounds(rounds)))
+}
+
+// CodexContinueMaxRounds 返回单次请求最大续想轮数（含首轮）。
+func (s *Store) CodexContinueMaxRounds() int {
+	if s == nil {
+		return 8
+	}
+	return int(s.codexContinueMaxRounds.Load())
+}
+
+// SetCodexCLIVersionSyncEnabled 设置是否后台定时同步 Codex CLI 模拟版本。
+func (s *Store) SetCodexCLIVersionSyncEnabled(enabled bool) {
+	if s == nil {
+		return
+	}
+	s.codexCLIVersionSyncEnabled.Store(enabled)
+}
+
+// CodexCLIVersionSyncEnabled 返回是否后台定时同步 Codex CLI 模拟版本。
+func (s *Store) CodexCLIVersionSyncEnabled() bool {
+	if s == nil {
+		return true
+	}
+	return s.codexCLIVersionSyncEnabled.Load()
+}
+
+// SetCodexCLIVersionSyncIntervalHours 设置定时同步间隔（小时，钳到 1-720）。
+func (s *Store) SetCodexCLIVersionSyncIntervalHours(hours int) {
+	if s == nil {
+		return
+	}
+	s.codexCLIVersionSyncInterval.Store(int64(database.NormalizeCodexCLIVersionSyncIntervalHours(hours)))
+}
+
+// CodexCLIVersionSyncIntervalHours 返回定时同步间隔（小时）。
+func (s *Store) CodexCLIVersionSyncIntervalHours() int {
+	if s == nil {
+		return 12
+	}
+	return int(s.codexCLIVersionSyncInterval.Load())
 }
 
 // GetProxyURL 获取全局代理地址
@@ -4306,6 +4387,52 @@ func (s *Store) SetMaxRateLimitRetries(n int) {
 
 func (s *Store) GetMaxRateLimitRetries() int {
 	return int(atomic.LoadInt64(&s.maxRateLimitRetries))
+}
+
+// normalizeRetryIntervalMS 把重试间隔限制在 0-30000ms(0 = 立即重试)。
+func normalizeRetryIntervalMS(ms int) int {
+	if ms < 0 {
+		return 0
+	}
+	if ms > 30000 {
+		return 30000
+	}
+	return ms
+}
+
+// SetRetryIntervalMS 动态更新重试间隔（毫秒）。
+func (s *Store) SetRetryIntervalMS(ms int) {
+	if s == nil {
+		return
+	}
+	s.retryIntervalMS.Store(int64(normalizeRetryIntervalMS(ms)))
+}
+
+// GetRetryIntervalMS 获取当前重试间隔（毫秒），0 = 立即重试。
+func (s *Store) GetRetryIntervalMS() int {
+	if s == nil {
+		return 0
+	}
+	return int(s.retryIntervalMS.Load())
+}
+
+// SetTransportRetryPolicy 动态更新传输错误重试策略（rotate / sticky）。
+func (s *Store) SetTransportRetryPolicy(policy string) {
+	if s == nil {
+		return
+	}
+	s.transportRetryPolicy.Store(database.NormalizeTransportRetryPolicy(policy))
+}
+
+// GetTransportRetryPolicy 获取传输错误重试策略，缺省 rotate（换号，旧行为）。
+func (s *Store) GetTransportRetryPolicy() string {
+	if s == nil {
+		return "rotate"
+	}
+	if v, ok := s.transportRetryPolicy.Load().(string); ok && v != "" {
+		return v
+	}
+	return "rotate"
 }
 
 // GetAllowRemoteMigration 获取是否允许远程迁移
@@ -5748,8 +5875,9 @@ const wsAuthVerifyMinInterval = 30 * time.Second
 // 背景：token 失效在 HTTP 通道会返回 401 → 走 applyCooldown 标记 unauthorized 冷却；
 // 但在 WS 通道上游是用 close 1008 踢连接，被归类为普通 transport 失败，账号不会被封、
 // 仍留在号池反复失败。这里用一次探针把"看不见的 401"补成与 HTTP 一致的处理：
-// 探针命中 401 时 usage_probe 会 MarkCooldownWithError(unauthorized)；若只是内容策略/
-// 网络抖动触发的 1008，探针返回正常，不会误封。带最小间隔节流。
+// wham 探针 401 时由 /responses 回退探针裁决，回退命中 401 才 MarkCooldownWithError
+// （wham 单方面 401 不定罪，避免误封 wham 恒 401 但流量可用的 codex_at 账号，issue #328）；
+// 若只是内容策略/网络抖动触发的 1008，探针返回正常，不会误封。带最小间隔节流。
 func (s *Store) VerifyAccountAuthAsync(account *Account) {
 	if s == nil || account == nil {
 		return

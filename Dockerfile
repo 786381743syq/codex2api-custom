@@ -19,7 +19,7 @@ RUN VITE_APP_VERSION=${BUILD_VERSION} npm run build
 # Stage 2: 鏋勫缓 Go 鍚庣
 # 浣跨敤 BUILDPLATFORM 鍘熺敓杩愯 + TARGETARCH 浜ゅ弶缂栬瘧
 # ============================================================
-FROM --platform=$BUILDPLATFORM golang:1.26.4-alpine AS go-builder
+FROM --platform=$BUILDPLATFORM golang:1.26.5-alpine AS go-builder
 
 ARG TARGETARCH
 ARG BUILD_VERSION=dev

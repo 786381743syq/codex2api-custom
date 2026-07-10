@@ -1067,6 +1067,70 @@ func TestPrepareResponsesBody_SparkModelKeepsExplicitImageGenerationTool(t *test
 	}
 }
 
+func TestPrepareResponsesBody_ImageGenNamespaceToolSkipsInjectionAndBridge(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.5",
+		"input":"draw a poster",
+		"tools":[{"type":"namespace","name":"image_gen","tools":[{"type":"function","name":"imagegen"}]}]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	tools := gjson.GetBytes(got, "tools")
+	for _, tool := range tools.Array() {
+		if tool.Get("type").String() == "image_generation" {
+			t.Fatalf("hosted image_generation tool should not be injected alongside image_gen namespace, got %s", string(got))
+		}
+	}
+	if gjson.GetBytes(got, "tools.0.name").String() != "image_gen" {
+		t.Fatalf("namespace image_gen tool should be preserved, got %s", string(got))
+	}
+	if instructions := gjson.GetBytes(got, "instructions").String(); strings.Contains(instructions, codexImageGenerationBridgeMarker) {
+		t.Fatalf("bridge instructions should not be injected when image_gen namespace is present, got %q", instructions)
+	}
+}
+
+func TestPrepareResponsesBody_ImageGenNamespaceInAdditionalToolsSkipsInjection(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.5",
+		"input":[
+			{"type":"additional_tools","tools":[{"type":"namespace","name":"image_gen"}]},
+			{"role":"user","content":"draw a poster"}
+		]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	for _, tool := range gjson.GetBytes(got, "tools").Array() {
+		if tool.Get("type").String() == "image_generation" {
+			t.Fatalf("hosted image_generation tool should not be injected for additional_tools image_gen, got %s", string(got))
+		}
+	}
+	if instructions := gjson.GetBytes(got, "instructions").String(); strings.Contains(instructions, codexImageGenerationBridgeMarker) {
+		t.Fatalf("bridge instructions should not be injected, got %q", instructions)
+	}
+}
+
+func TestPrepareResponsesBody_NonImageNamespaceToolStillInjectsDefault(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.5",
+		"input":"hello",
+		"tools":[{"type":"namespace","name":"code_tools","tools":[{"type":"function","name":"run"}]}]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	found := false
+	for _, tool := range gjson.GetBytes(got, "tools").Array() {
+		if tool.Get("type").String() == "image_generation" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("non-image namespace tool should not suppress default injection, got %s", string(got))
+	}
+}
+
 func TestPrepareResponsesBody_NormalizesNestedReasoningEffortAliases(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5.4",
@@ -2362,6 +2426,63 @@ func TestExtractToolCallsFromOutput(t *testing.T) {
 	}
 }
 
+// issue #330：上游要求 tool_search_call.arguments 为 object、function_call.arguments
+// 为 string；回放历史时类型不符会被上游 400 拒绝，需在发送前修正。
+func TestNormalizeResponsesToolCallArgumentTypes(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.5",
+		"input":[
+			{"type":"tool_search_call","call_id":"c1","arguments":"{\"queries\":[\"weather\"]}"},
+			{"type":"tool_search_call","call_id":"c2","arguments":""},
+			{"type":"tool_search_call","call_id":"c3","arguments":{"queries":["ok"]}},
+			{"type":"function_call","call_id":"c4","name":"get_weather","arguments":{"city":"NYC"}},
+			{"type":"function_call","call_id":"c5","name":"get_time","arguments":"{}"},
+			{"type":"tool_search_call","call_id":"c6","arguments":"not-json"},
+			{"type":"message","role":"user","content":"hi"}
+		]
+	}`)
+
+	var body map[string]any
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if !normalizeResponsesToolCallArgumentTypes(body) {
+		t.Fatal("expected modification, got false")
+	}
+
+	got, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	items := gjson.GetBytes(got, "input").Array()
+
+	if !items[0].Get("arguments").IsObject() {
+		t.Fatalf("tool_search_call string arguments should be parsed to object: %s", items[0].Raw)
+	}
+	if items[0].Get("arguments.queries.0").String() != "weather" {
+		t.Fatalf("parsed arguments should keep content: %s", items[0].Raw)
+	}
+	if !items[1].Get("arguments").IsObject() {
+		t.Fatalf("empty string arguments should become empty object: %s", items[1].Raw)
+	}
+	if !items[2].Get("arguments").IsObject() {
+		t.Fatalf("object arguments should stay object: %s", items[2].Raw)
+	}
+	if items[3].Get("arguments").Type != gjson.String {
+		t.Fatalf("function_call object arguments should be serialized to string: %s", items[3].Raw)
+	}
+	if items[3].Get("arguments").String() != `{"city":"NYC"}` {
+		t.Fatalf("serialized arguments should keep content, got %q", items[3].Get("arguments").String())
+	}
+	if items[4].Get("arguments").String() != "{}" {
+		t.Fatalf("function_call string arguments should be untouched: %s", items[4].Raw)
+	}
+	if items[5].Get("arguments").String() != "not-json" {
+		t.Fatalf("unparseable tool_search_call arguments should be left as-is: %s", items[5].Raw)
+	}
+}
+
 func TestNormalizeResponsesCompactionItemsConvertsToDeveloperMessage(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5.4",
@@ -2645,5 +2766,61 @@ func TestTranslateRequest_NormalizesWebSearchPreviewToolType(t *testing.T) {
 	}
 	if gjson.GetBytes(got, "tools.0.totally_made_up").Exists() {
 		t.Fatalf("expected unknown field to be stripped; body=%s", got)
+	}
+}
+
+// compact 端点不接受 client_metadata(Unknown parameter),两条 compact 准备
+// 路径都必须剥除;普通 /responses 路径不剥(引擎指纹与中转链依赖透传)。
+func TestPrepareCompactBodiesStripClientMetadata(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"stream":true,
+		"client_metadata":{"x-codex-window-id":"w-1"},
+		"input":[{"role":"user","content":"hello"},{"type":"compaction_trigger"}]
+	}`)
+
+	codexBody, _ := PrepareCompactResponsesBodyForOwner(raw, "")
+	if gjson.GetBytes(codexBody, "client_metadata").Exists() {
+		t.Fatalf("codex compact body should strip client_metadata, got %s", codexBody)
+	}
+
+	relayBody := PrepareOpenAIResponsesCompactBody(raw)
+	if gjson.GetBytes(relayBody, "client_metadata").Exists() {
+		t.Fatalf("relay compact body should strip client_metadata, got %s", relayBody)
+	}
+}
+
+// max 档位按模型放行:gpt-5.6 起上游接受并回显,旧模型上游 400,须钳到 xhigh。
+func TestNormalizeReasoningEffortForModel_MaxGatedByModel(t *testing.T) {
+	cases := []struct {
+		effort, model, want string
+	}{
+		{"max", "gpt-5.6-sol", "max"},
+		{"MAX", "gpt-5.6-terra", "max"},
+		{"max", "gpt-5.6", "max"},
+		{"max", "gpt-6.0", "max"},
+		{"max", "gpt-5.4", "xhigh"},
+		{"max", "gpt-5.5", "xhigh"},
+		{"max", "", "xhigh"},
+		{"max", "claude-opus", "xhigh"},
+		{"xhigh", "gpt-5.6-sol", "xhigh"},
+		{"none", "gpt-5.4", "none"},
+	}
+	for _, tc := range cases {
+		if got := normalizeReasoningEffortForModel(tc.effort, tc.model); got != tc.want {
+			t.Errorf("normalizeReasoningEffortForModel(%q, %q) = %q, want %q", tc.effort, tc.model, got, tc.want)
+		}
+	}
+}
+
+func TestPrepareResponsesBody_MaxEffortPassthroughByModel(t *testing.T) {
+	got, _ := PrepareResponsesBody([]byte(`{"model":"gpt-5.6-sol","input":"hi","reasoning":{"effort":"max"}}`))
+	if effort := gjson.GetBytes(got, "reasoning.effort").String(); effort != "max" {
+		t.Fatalf("gpt-5.6-sol effort = %q, want max; body=%s", effort, got)
+	}
+
+	got, _ = PrepareResponsesBody([]byte(`{"model":"gpt-5.4","input":"hi","reasoning":{"effort":"max"}}`))
+	if effort := gjson.GetBytes(got, "reasoning.effort").String(); effort != "xhigh" {
+		t.Fatalf("gpt-5.4 effort = %q, want xhigh; body=%s", effort, got)
 	}
 }

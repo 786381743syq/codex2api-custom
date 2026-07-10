@@ -80,6 +80,10 @@ type Handler struct {
 	// 「主动重置次数」消耗操作的账号级互斥锁（dbID -> *sync.Mutex），
 	// 串行化同一账号的并发重置，避免重复消耗与次数计数竞态。
 	resetCreditLocks sync.Map
+
+	// 重复账号合并互斥锁：串行化 mergeRefreshedDuplicateIntoExisting，
+	// 防止并发导入同一身份的多个账号时互相合并、把双方都软删（账号丢失）。
+	mergeDuplicateMu sync.Mutex
 }
 
 type chartCacheEntry struct {
@@ -216,6 +220,11 @@ func (h *Handler) mergeRefreshedDuplicateIntoExisting(newID int64, source string
 	if h == nil || h.db == nil || h.store == nil {
 		return false
 	}
+	// 串行化合并：并发导入同一身份的多个账号时，两个合并流程若交错执行，
+	// 可能互相把对方选为“已有账号”，导致双方都被软删（账号丢失）。
+	h.mergeDuplicateMu.Lock()
+	defer h.mergeDuplicateMu.Unlock()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -262,13 +271,16 @@ func (h *Handler) mergeRefreshedDuplicateIntoExisting(newID int64, source string
 		log.Printf("合并导入账号 %d 凭证到已有账号 %d 失败: %v", newID, oldID, err)
 		return false
 	}
-	if err := h.reloadTokenAccount(ctx, oldID, source); err != nil {
-		log.Printf("合并后重载账号 %d 失败: %v", oldID, err)
-	}
+	// 先软删新账号、再重载旧账号：reloadTokenAccount 会异步触发旧账号的
+	// 探针→再合并，若此刻新账号仍活跃，反向查重会把旧账号合并进新账号，
+	// 两边都被软删。软删前置让后续任何查重都看不到新账号。
 	if err := h.db.SoftDeleteAccount(ctx, newID); err != nil {
 		log.Printf("软删重复导入账号 %d 失败: %v", newID, err)
 	}
 	h.store.RemoveAccount(newID)
+	if err := h.reloadTokenAccount(ctx, oldID, source); err != nil {
+		log.Printf("合并后重载账号 %d 失败: %v", oldID, err)
+	}
 	h.db.InsertAccountEventAsync(newID, "deleted", fmt.Sprintf("merged_into_%d", oldID))
 	h.db.InsertAccountEventAsync(oldID, "updated", "rt_upgrade_merge")
 	log.Printf("导入账号 %d 与已有账号 %d 同一 OAuth 身份，已合并凭证（RT 升级）并保留用量统计 (source=%s)", newID, oldID, source)
@@ -454,6 +466,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/prompt-filter/rules", h.GetPromptFilterRules)
 	api.GET("/models", h.ListModels)
 	api.POST("/models/sync", h.SyncModels)
+	api.POST("/codex-cli-version/sync", h.SyncCodexCLIVersion)
 	api.GET("/image-prompts", h.ListImagePromptTemplates)
 	api.POST("/image-prompts", h.CreateImagePromptTemplate)
 	api.PATCH("/image-prompts/:id", h.UpdateImagePromptTemplate)
@@ -5833,6 +5846,9 @@ func (h *Handler) ListAPIKeys(c *gin.Context) {
 		cost30d, _ = h.db.GetAllAPIKeysWindowCost(ctx, 30*24*time.Hour)
 	}
 
+	// 最近使用时间：一次聚合，失败不阻断列表
+	lastUsedByID, _ := h.db.ListAPIKeyLastUsedAt(ctx)
+
 	// 转换为脱敏响应
 	maskedKeys := make([]*MaskedAPIKeyRow, 0, len(keys))
 	for _, k := range keys {
@@ -5849,6 +5865,12 @@ func (h *Handler) ListAPIKeys(c *gin.Context) {
 				detail.Cost30d = cost30d[k.ID]
 			}
 			mk.WindowUsage = detail
+		}
+		if lastUsedByID != nil {
+			if lastUsed, ok := lastUsedByID[k.ID]; ok && !lastUsed.IsZero() {
+				formatted := lastUsed.Format(time.RFC3339)
+				mk.LastUsedAt = &formatted
+			}
 		}
 		maskedKeys = append(maskedKeys, mk)
 	}
@@ -6360,10 +6382,17 @@ type settingsResponse struct {
 	CodexWSHideUpstreamErrors          bool     `json:"codex_ws_hide_upstream_errors"`
 	CodexWSSilentRetryEnabled          bool     `json:"codex_ws_silent_retry_enabled"`
 	CodexWSSilentMaxRetries            int      `json:"codex_ws_silent_max_retries"`
+	CodexContinueThinkingEnabled       bool     `json:"codex_continue_thinking_enabled"`
+	CodexContinueMaxRounds             int      `json:"codex_continue_max_rounds"`
+	CodexCLIVersionSyncEnabled         bool     `json:"codex_cli_version_sync_enabled"`
+	CodexCLIVersionSyncIntervalHours   int      `json:"codex_cli_version_sync_interval_hours"`
+	CodexSyncedCLIVersion              string   `json:"codex_synced_cli_version"`
 	SchedulerMode                      string   `json:"scheduler_mode"`
 	AffinityMode                       string   `json:"affinity_mode"`
 	MaxRetries                         int      `json:"max_retries"`
 	MaxRateLimitRetries                int      `json:"max_rate_limit_retries"`
+	RetryIntervalMS                    int      `json:"retry_interval_ms"`
+	TransportRetryPolicy               string   `json:"transport_retry_policy"`
 	AllowRemoteMigration               bool     `json:"allow_remote_migration"`
 	DatabaseDriver                     string   `json:"database_driver"`
 	DatabaseLabel                      string   `json:"database_label"`
@@ -6458,10 +6487,16 @@ type updateSettingsReq struct {
 	CodexWSHideUpstreamErrors          *bool    `json:"codex_ws_hide_upstream_errors"`
 	CodexWSSilentRetryEnabled          *bool    `json:"codex_ws_silent_retry_enabled"`
 	CodexWSSilentMaxRetries            *int     `json:"codex_ws_silent_max_retries"`
+	CodexContinueThinkingEnabled       *bool    `json:"codex_continue_thinking_enabled"`
+	CodexContinueMaxRounds             *int     `json:"codex_continue_max_rounds"`
+	CodexCLIVersionSyncEnabled         *bool    `json:"codex_cli_version_sync_enabled"`
+	CodexCLIVersionSyncIntervalHours   *int     `json:"codex_cli_version_sync_interval_hours"`
 	SchedulerMode                      *string  `json:"scheduler_mode"`
 	AffinityMode                       *string  `json:"affinity_mode"`
 	MaxRetries                         *int     `json:"max_retries"`
 	MaxRateLimitRetries                *int     `json:"max_rate_limit_retries"`
+	RetryIntervalMS                    *int     `json:"retry_interval_ms"`
+	TransportRetryPolicy               *string  `json:"transport_retry_policy"`
 	AllowRemoteMigration               *bool    `json:"allow_remote_migration"`
 	ModelMapping                       *string  `json:"model_mapping"`
 	CodexModelMapping                  *string  `json:"codex_model_mapping"`
@@ -7054,10 +7089,17 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		CodexWSHideUpstreamErrors:          h.store.CodexWSHideUpstreamErrors(),
 		CodexWSSilentRetryEnabled:          h.store.CodexWSSilentRetryEnabled(),
 		CodexWSSilentMaxRetries:            h.store.CodexWSSilentMaxRetries(),
+		CodexContinueThinkingEnabled:       h.store.CodexContinueThinkingEnabled(),
+		CodexContinueMaxRounds:             h.store.CodexContinueMaxRounds(),
+		CodexCLIVersionSyncEnabled:         h.store.CodexCLIVersionSyncEnabled(),
+		CodexCLIVersionSyncIntervalHours:   h.store.CodexCLIVersionSyncIntervalHours(),
+		CodexSyncedCLIVersion:              proxy.CurrentRuntimeSettings().CodexSyncedCLIVersion,
 		SchedulerMode:                      h.store.GetSchedulerMode(),
 		AffinityMode:                       h.store.GetAffinityMode(),
 		MaxRetries:                         h.store.GetMaxRetries(),
 		MaxRateLimitRetries:                h.store.GetMaxRateLimitRetries(),
+		RetryIntervalMS:                    h.store.GetRetryIntervalMS(),
+		TransportRetryPolicy:               h.store.GetTransportRetryPolicy(),
 		AllowRemoteMigration:               h.store.GetAllowRemoteMigration() && adminAuthSource != "disabled",
 		DatabaseDriver:                     h.databaseDriver,
 		DatabaseLabel:                      h.databaseLabel,
@@ -7460,6 +7502,32 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: codex_ws_silent_max_retries = %d", v)
 	}
 
+	if req.CodexContinueThinkingEnabled != nil {
+		h.store.SetCodexContinueThinkingEnabled(*req.CodexContinueThinkingEnabled)
+		runtimeCfg.CodexContinueThinking = *req.CodexContinueThinkingEnabled
+		log.Printf("设置已更新: codex_continue_thinking_enabled = %t", *req.CodexContinueThinkingEnabled)
+	}
+
+	if req.CodexContinueMaxRounds != nil {
+		v := database.NormalizeCodexContinueMaxRounds(*req.CodexContinueMaxRounds)
+		h.store.SetCodexContinueMaxRounds(v)
+		runtimeCfg.CodexContinueMaxRounds = v
+		log.Printf("设置已更新: codex_continue_max_rounds = %d", v)
+	}
+
+	if req.CodexCLIVersionSyncEnabled != nil {
+		h.store.SetCodexCLIVersionSyncEnabled(*req.CodexCLIVersionSyncEnabled)
+		runtimeCfg.CodexCLIVersionSyncEnabled = *req.CodexCLIVersionSyncEnabled
+		log.Printf("设置已更新: codex_cli_version_sync_enabled = %t", *req.CodexCLIVersionSyncEnabled)
+	}
+
+	if req.CodexCLIVersionSyncIntervalHours != nil {
+		v := database.NormalizeCodexCLIVersionSyncIntervalHours(*req.CodexCLIVersionSyncIntervalHours)
+		h.store.SetCodexCLIVersionSyncIntervalHours(v)
+		runtimeCfg.CodexCLIVersionSyncIntervalHours = v
+		log.Printf("设置已更新: codex_cli_version_sync_interval_hours = %d", v)
+	}
+
 	if req.SchedulerMode != nil {
 		h.store.SetSchedulerMode(*req.SchedulerMode)
 		log.Printf("设置已更新: scheduler_mode = %s", *req.SchedulerMode)
@@ -7492,6 +7560,24 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		}
 		h.store.SetMaxRateLimitRetries(v)
 		log.Printf("设置已更新: max_rate_limit_retries = %d", v)
+	}
+
+	if req.RetryIntervalMS != nil {
+		v := *req.RetryIntervalMS
+		if v < 0 {
+			v = 0
+		}
+		if v > 30000 {
+			v = 30000
+		}
+		h.store.SetRetryIntervalMS(v)
+		log.Printf("设置已更新: retry_interval_ms = %d", v)
+	}
+
+	if req.TransportRetryPolicy != nil {
+		v := database.NormalizeTransportRetryPolicy(*req.TransportRetryPolicy)
+		h.store.SetTransportRetryPolicy(v)
+		log.Printf("设置已更新: transport_retry_policy = %s", v)
 	}
 
 	if req.AllowRemoteMigration != nil {
@@ -7845,10 +7931,17 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexWSHideUpstreamErrors:          h.store.CodexWSHideUpstreamErrors(),
 		CodexWSSilentRetryEnabled:          h.store.CodexWSSilentRetryEnabled(),
 		CodexWSSilentMaxRetries:            h.store.CodexWSSilentMaxRetries(),
+		CodexContinueThinkingEnabled:       h.store.CodexContinueThinkingEnabled(),
+		CodexContinueMaxRounds:             h.store.CodexContinueMaxRounds(),
+		CodexCLIVersionSyncEnabled:         h.store.CodexCLIVersionSyncEnabled(),
+		CodexCLIVersionSyncIntervalHours:   h.store.CodexCLIVersionSyncIntervalHours(),
+		CodexSyncedCLIVersion:              proxy.CurrentRuntimeSettings().CodexSyncedCLIVersion,
 		SchedulerMode:                      h.store.GetSchedulerMode(),
 		AffinityMode:                       h.store.GetAffinityMode(),
 		MaxRetries:                         h.store.GetMaxRetries(),
 		MaxRateLimitRetries:                h.store.GetMaxRateLimitRetries(),
+		RetryIntervalMS:                    h.store.GetRetryIntervalMS(),
+		TransportRetryPolicy:               h.store.GetTransportRetryPolicy(),
 		AllowRemoteMigration:               h.store.GetAllowRemoteMigration() && hasAdminSecret,
 		ModelMapping:                       h.store.GetModelMapping(),
 		CodexModelMapping:                  h.store.GetCodexModelMapping(),
@@ -7951,6 +8044,11 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexWSHideUpstreamErrors:          h.store.CodexWSHideUpstreamErrors(),
 		CodexWSSilentRetryEnabled:          h.store.CodexWSSilentRetryEnabled(),
 		CodexWSSilentMaxRetries:            h.store.CodexWSSilentMaxRetries(),
+		CodexContinueThinkingEnabled:       h.store.CodexContinueThinkingEnabled(),
+		CodexContinueMaxRounds:             h.store.CodexContinueMaxRounds(),
+		CodexCLIVersionSyncEnabled:         h.store.CodexCLIVersionSyncEnabled(),
+		CodexCLIVersionSyncIntervalHours:   h.store.CodexCLIVersionSyncIntervalHours(),
+		CodexSyncedCLIVersion:              proxy.CurrentRuntimeSettings().CodexSyncedCLIVersion,
 		SchedulerMode:                      h.store.GetSchedulerMode(),
 		AffinityMode:                       h.store.GetAffinityMode(),
 		MaxRetries:                         h.store.GetMaxRetries(),
@@ -8363,6 +8461,24 @@ func (h *Handler) SyncModels(c *gin.Context) {
 	defer cancel()
 
 	result, err := proxy.SyncOfficialCodexModels(ctx, h.db)
+	if err != nil {
+		writeError(c, http.StatusBadGateway, err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, result)
+}
+
+// SyncCodexCLIVersion 从 openai/codex releases 拉取最新稳定版本，
+// 抬升出站 UA / manifest 的模拟版本（绝不降级），供设置页「立即同步」按钮调用。
+func (h *Handler) SyncCodexCLIVersion(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 20*time.Second)
+	defer cancel()
+
+	proxyURL := ""
+	if h.store != nil {
+		proxyURL = h.store.GetProxyURL()
+	}
+	result, err := proxy.SyncCodexCLIVersion(ctx, h.db, proxyURL)
 	if err != nil {
 		writeError(c, http.StatusBadGateway, err.Error())
 		return
